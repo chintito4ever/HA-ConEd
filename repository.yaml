@@ -1,4 +1,4 @@
 # https://developers.home-assistant.io/docs/add-ons/repository#repository-configuration
-name: Con Edison
-url: https://github.com/zodyking/HA-ConEd
-maintainer: zodyking
+name: Con Edison (multi-account fork)
+url: https://github.com/chintito4ever/HA-ConEd
+maintainer: chintito4ever

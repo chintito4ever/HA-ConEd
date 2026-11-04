@@ -51,6 +51,10 @@ This updates `config.yaml`, `main.py` `CODE_VERSION`, and the startup log in `ro
 | `ConEd_current_cycle_usage` | Usage to date (kWh) |
 | `ConEd_forecasted_usage` | Projected usage (kWh) |
 
+## Multi-account fork
+
+This fork adds support for several Con Edison accounts on one login (see [Multiple Con Edison accounts](coned_scraper/DOCS.md#multiple-con-edison-accounts)). To install it, add `https://github.com/chintito4ever/HA-ConEd#multi-account` as a repository and install **Con Edison (multi-account)**. Stop the original add-on first; the fork imports its data on first start.
+
 ## Installation
 
 1. In Home Assistant: **Settings → Add-ons → Add-on Store → ⋮ → Repositories**

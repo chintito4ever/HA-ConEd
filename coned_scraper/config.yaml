@@ -3,7 +3,7 @@ name: Con Edison (multi-account)
 version: "1.4.0"
 slug: coned_scraper
 description: Con Edison integration for Home Assistant — bills, payments and balance for every account on your login
-url: https://github.com/zodyking/HA-ConEd
+url: https://github.com/chintito4ever/HA-ConEd
 ingress: true
 ingress_port: 8000
 panel_icon: mdi:flash
