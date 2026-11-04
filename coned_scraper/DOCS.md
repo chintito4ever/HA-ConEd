@@ -22,6 +22,17 @@ Controls the verbosity of addon logs. Default: `info`
 - `error` - Errors only
 - `fatal` - Critical failures only
 
+### Option: `prisma_studio`
+
+Runs Prisma Studio, a database browser, on port 5555. Default: `false`.
+
+Prisma Studio has **no password**: anyone who can reach the port can read and change the database, including your saved ConEd login. To use it:
+
+1. Turn on `prisma_studio` in the add-on **Configuration** tab.
+2. Under **Network**, enter a host port for `5555/tcp` (it's empty by default, so nothing is exposed).
+3. Restart the add-on and open `http://<your-HA-address>:<port>`.
+4. When you're done, turn the option off and clear the port again.
+
 ## First-Time Setup
 
 1. Open the Con Edison panel from the sidebar.

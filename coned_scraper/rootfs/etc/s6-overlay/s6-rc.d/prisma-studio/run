@@ -12,6 +12,13 @@ POSTGRES_PORT="5432"
 
 cd /app/python-service
 
+# Studio has no login: anyone who can reach the port can read and change the
+# database, including saved ConEd credentials. Only run it when turned on.
+if ! bashio::config.true 'prisma_studio'; then
+    bashio::log.info "Prisma Studio is off (turn on 'prisma_studio' in the add-on configuration to use it)"
+    exec sleep infinity
+fi
+
 # Wait for PostgreSQL and coned database to be ready
 bashio::log.info "Waiting for PostgreSQL before Prisma Studio..."
 until PGPASSWORD=coned psql -h localhost -p "${POSTGRES_PORT}" -U coned -d coned -t -c "SELECT 1" > /dev/null 2>&1; do

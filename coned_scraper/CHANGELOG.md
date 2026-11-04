@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.3
+
+### Security
+- Prisma Studio (database UI on port 5555, no password) is off by default and its port is no longer opened on the host. Turn on `prisma_studio` and set the port under Network only while you need it
+
 ## 1.4.2
 
 ### Fixed

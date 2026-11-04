@@ -38,7 +38,7 @@ from account_context import (
 app = FastAPI(title="Con Edison API")
 
 # Code version for deployment verification
-CODE_VERSION = "1.4.2"
+CODE_VERSION = "1.4.3"
 
 @app.on_event("startup")
 async def startup():

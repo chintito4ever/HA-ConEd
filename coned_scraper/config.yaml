@@ -1,6 +1,6 @@
 ---
 name: Con Edison (multi-account)
-version: "1.4.2"
+version: "1.4.3"
 slug: coned_scraper
 description: Con Edison integration for Home Assistant — bills, payments and balance for every account on your login
 url: https://github.com/chintito4ever/HA-ConEd
@@ -19,10 +19,12 @@ map:
   - homeassistant_config:rw
   - all_addon_configs:ro
 ports:
-  5555/tcp: 5555
+  5555/tcp: null
 ports_description:
-  5555/tcp: "Prisma Studio (Database UI)"
+  5555/tcp: "Prisma Studio (Database UI, no password; off unless enabled)"
 options:
   log_level: info
+  prisma_studio: false
 schema:
   log_level: list(trace|debug|info|notice|warning|error|fatal)
+  prisma_studio: bool

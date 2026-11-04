@@ -1,3 +1,14 @@
 name: Con Edison
 description: Con Edison account integration for Home Assistant — bills, payments, balance, MQTT
 panel_title: Con Edison
+configuration:
+  log_level:
+    name: Log level
+    description: How much detail the add-on writes to its log.
+  prisma_studio:
+    name: Prisma Studio (database UI)
+    description: >-
+      Runs a database browser with no password. Leave off unless you need it.
+      When on, also set a host port under Network to reach it, and turn it off when done.
+network:
+  5555/tcp: Prisma Studio (no password). Leave empty to keep it unreachable.

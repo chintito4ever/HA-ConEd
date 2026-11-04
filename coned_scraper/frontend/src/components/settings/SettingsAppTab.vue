@@ -21,7 +21,7 @@
         >
           Open Prisma Studio
         </a>
-        <div class="ha-helper">Database browser UI (port 5555). Use when accessing HA from the same network.</div>
+        <div class="ha-helper">Database browser UI (port 5555). Off by default because it has no password: turn on Prisma Studio in the add-on Configuration tab and set port 5555 under Network, then turn it off when done.</div>
       </div>
 
     </div>
