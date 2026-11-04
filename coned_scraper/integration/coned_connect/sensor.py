@@ -14,8 +14,11 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN, SENSORS
+from .const import DOMAIN, PRIMARY_ACCOUNT, SENSORS
 from .coordinator import ConEdisonDataUpdateCoordinator
+
+# Usage sensors whose unit follows the meter (kWh for electric, therms/CCF for gas)
+_USAGE_SENSORS = {"last_bill_kwh", "current_cycle_usage", "forecasted_usage"}
 
 
 async def async_setup_entry(
@@ -24,10 +27,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Con Edison sensors from a config entry."""
-    coordinator: ConEdisonDataUpdateCoordinator = hass.data[DOMAIN][entry.entry_id]
+    coordinators: dict[str, ConEdisonDataUpdateCoordinator] = hass.data[DOMAIN][entry.entry_id]
     
     entities = [
         ConEdisonSensor(coordinator, entry, sensor_type)
+        for coordinator in coordinators.values()
         for sensor_type in SENSORS
     ]
     
@@ -51,7 +55,14 @@ class ConEdisonSensor(CoordinatorEntity[ConEdisonDataUpdateCoordinator], SensorE
         self._sensor_type = sensor_type
         self._sensor_config = SENSORS[sensor_type]
         
-        self._attr_unique_id = f"{entry.entry_id}_{sensor_type}"
+        account_key = coordinator.account_key
+        # The primary account keeps the IDs it had before multi-account support
+        if account_key == PRIMARY_ACCOUNT:
+            self._attr_unique_id = f"{entry.entry_id}_{sensor_type}"
+            device_id = entry.entry_id
+        else:
+            self._attr_unique_id = f"{entry.entry_id}_{account_key}_{sensor_type}"
+            device_id = f"{entry.entry_id}_{account_key}"
         self._attr_name = self._sensor_config["name"]
         self._attr_native_unit_of_measurement = self._sensor_config.get("unit")
         self._attr_icon = self._sensor_config.get("icon")
@@ -74,12 +85,27 @@ class ConEdisonSensor(CoordinatorEntity[ConEdisonDataUpdateCoordinator], SensorE
         else:
             self._attr_state_class = None
         
+        label = coordinator.account_label
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name="ConEd Connect",
+            identifiers={(DOMAIN, device_id)},
+            name=f"ConEd Connect {label}" if label else "ConEd Connect",
             manufacturer="HA-ConEd",
             model="ConEd Connect Account",
         )
+
+    @property
+    def native_unit_of_measurement(self) -> str | None:
+        """Usage sensors show the meter's unit; gas accounts report therms or CCF."""
+        if self._sensor_type in _USAGE_SENSORS and self.coordinator.data:
+            return self.coordinator.data.get("usage_unit") or self._attr_native_unit_of_measurement
+        return self._attr_native_unit_of_measurement
+
+    @property
+    def device_class(self) -> SensorDeviceClass | None:
+        """Energy device class only fits kWh; gas usage has no matching class here."""
+        if self._sensor_type in _USAGE_SENSORS and self.native_unit_of_measurement != "kWh":
+            return None
+        return self._attr_device_class
 
     @property
     def native_value(self) -> Any:

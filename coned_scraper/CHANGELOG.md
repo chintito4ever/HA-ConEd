@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.4.0
+
+### Added
+- Several Con Edison accounts on one login. Every account in coned.com's "My Service Accounts" list is scraped on each run, with its own balance, bills, payments, PDFs, usage and alerts
+- Account switcher in the panel header, with a rename button. Each account is named after its service address until you rename it
+- One ConEd Connect device per account in Home Assistant. The existing account keeps its sensor IDs and history
+- Gas meters: daily reads when the meter has no hourly data, and usage sensors in therms or CCF
+- Notifications and TTS name the account when there is more than one
+- `GET /api/accounts`, and `/api/a/<account>/...` to read any endpoint for one account
+- First start imports data from the original Con Edison add-on when it is stopped
+
+### Changed
+- Payees, notification settings, TTS settings and credentials are shared by all accounts
+- Data saved before this version belongs to the account whose bill history matches it
+
 ## 1.3.102
 
 ### Fixed

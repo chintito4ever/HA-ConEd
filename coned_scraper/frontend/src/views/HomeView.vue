@@ -5,6 +5,7 @@
         <div class="ha-logo-container">
           <img :src="logoUrl" alt="Con Edison" width="100" height="20" />
         </div>
+        <AccountSwitcher />
         <nav class="ha-nav">
           <button
             :class="['ha-nav-button', { active: activeTab === 'account-ledger' }]"
@@ -51,6 +52,7 @@
 <script setup lang="ts">
 import { ref, watch, onMounted, onUnmounted } from 'vue'
 import AccountLedger from '../components/AccountLedger.vue'
+import AccountSwitcher from '../components/AccountSwitcher.vue'
 import History from '../components/History.vue'
 import Settings from '../components/Settings.vue'
 import { logoUrl } from '../lib/assets'

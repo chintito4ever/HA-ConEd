@@ -13,11 +13,12 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.network import get_url
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
-from .const import DOMAIN, SCAN_INTERVAL
+from .const import ADDON_SLUG, DOMAIN, PRIMARY_ACCOUNT, SCAN_INTERVAL
 
 _LOGGER = logging.getLogger(__name__)
 
-ADDON_SLUG = "9a4bbad0_coned_scraper"
+# Opower units -> what the sensors show
+_UNITS = {"KWH": "kWh", "THERM": "therms", "CCF": "CCF"}
 
 
 def extract_numeric(value: str | float | int | None) -> float:
@@ -36,15 +37,28 @@ def extract_numeric(value: str | float | int | None) -> float:
 class ConEdisonDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     """Class to manage fetching Con Edison data from the addon API."""
 
-    def __init__(self, hass: HomeAssistant, addon_url: str) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        addon_url: str,
+        account_key: str = PRIMARY_ACCOUNT,
+        account_label: str | None = None,
+    ) -> None:
         """Initialize."""
         super().__init__(
             hass,
             _LOGGER,
-            name=DOMAIN,
+            name=f"{DOMAIN}_{account_key}",
             update_interval=SCAN_INTERVAL,
         )
         self.addon_url = addon_url.rstrip("/")
+        self.account_key = account_key
+        self.account_label = account_label
+        # The add-on serves each ConEd account under /api/a/<key>/...
+        if account_key == PRIMARY_ACCOUNT:
+            self.api_url = f"{self.addon_url}/api"
+        else:
+            self.api_url = f"{self.addon_url}/api/a/{account_key}"
         self.hass = hass
         self._ingress_url: str | None = None
 
@@ -85,7 +99,7 @@ class ConEdisonDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Fetch ledger data (account_balance, bills, payments)
             async with session.get(
-                f"{self.addon_url}/api/ledger",
+                f"{self.api_url}/ledger",
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as response:
                 if response.status == 200:
@@ -122,7 +136,7 @@ class ConEdisonDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     
             # Fetch bill details (due_date, kwh_cost, kwh_used)
             async with session.get(
-                f"{self.addon_url}/api/bill-details/latest",
+                f"{self.api_url}/bill-details/latest",
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as response:
                 if response.status == 200:
@@ -133,7 +147,7 @@ class ConEdisonDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Fetch meter reading data (current usage, forecast)
             async with session.get(
-                f"{self.addon_url}/api/meter-reading",
+                f"{self.api_url}/meter-reading",
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as response:
                 if response.status == 200:
@@ -141,6 +155,8 @@ class ConEdisonDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     data["current_usage_cost"] = meter.get("cost")
                     
                     forecast = meter.get("forecast", {})
+                    unit = str((forecast or {}).get("unit") or "").upper()
+                    data["usage_unit"] = _UNITS.get(unit, "kWh")
                     if forecast:
                         data["billing_start_date"] = forecast.get("start_date")
                         data["billing_end_date"] = forecast.get("end_date")
@@ -149,7 +165,7 @@ class ConEdisonDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             # Fetch bill PDF URL - check if PDF exists first
             async with session.get(
-                f"{self.addon_url}/api/bill-document",
+                f"{self.api_url}/bill-document",
                 timeout=aiohttp.ClientTimeout(total=10),
                 allow_redirects=False,
             ) as response:
@@ -158,9 +174,10 @@ class ConEdisonDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     ingress_entry = await self._get_ingress_url()
                     if ingress_entry:
                         base_url = get_url(self.hass, prefer_external=True, require_ssl=False)
-                        pdf_url = f"{base_url.rstrip('/')}{ingress_entry}/api/bill-document"
+                        api_path = self.api_url[len(self.addon_url):]
+                        pdf_url = f"{base_url.rstrip('/')}{ingress_entry}{api_path}/bill-document"
                     else:
-                        pdf_url = f"{self.addon_url}/api/bill-document"
+                        pdf_url = f"{self.api_url}/bill-document"
                     data["bill_pdf_url"] = "Check attributes"
                     data["bill_pdf_url_data"] = {"url": pdf_url}
 

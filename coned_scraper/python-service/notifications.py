@@ -11,6 +11,17 @@ logger = logging.getLogger(__name__)
 
 
 def ensure_con_edison_title(title: str) -> str:
+    """Ensure notification title includes Con Edison, and the account when there are several."""
+    from account_context import current_account_label
+
+    title = _con_edison_title(title)
+    label = current_account_label()
+    if label and label not in title:
+        return f"{title} ({label})"
+    return title
+
+
+def _con_edison_title(title: str) -> str:
     """Ensure notification title includes Con Edison (safeguard for stale DB configs)."""
     if not title:
         return "Con Edison"

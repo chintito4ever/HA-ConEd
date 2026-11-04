@@ -36,6 +36,29 @@ Controls the verbosity of addon logs. Default: `info`
 
 All addon data (credentials, MQTT config, schedule, database) is stored in the addon configuration directory and persists across restarts.
 
+## Multiple Con Edison accounts
+
+If your coned.com login has several service accounts (for example two gas accounts at different units), the addon tracks all of them. Nothing extra to configure: use the same credentials.
+
+- **Discovery:** each scrape reads the "My Service Accounts" list on coned.com and scrapes every account in it.
+- **Your existing data:** the first time several accounts show up, the addon compares your stored bills with each account's bill history and keeps them with the account they match.
+- **Panel:** pick an account from the **Account** menu in the header. ✏️ renames it. Names default to the service address.
+- **Home Assistant:** the ConEd Connect integration creates one device per account. The original account keeps its `sensor.coned_connect_*` entities. Other accounts get entities named after the account, for example `sensor.coned_connect_unit_2_account_balance`. Reload the integration after a new account first appears.
+- **Shared settings:** credentials, payees, notification and TTS settings apply to every account. Notifications and TTS name the account they are about.
+- **Usage (Opower):** each account uses its own meter. Gas meters usually report daily, in therms or CCF. Some panel charts still say kWh.
+- **API:** `GET /api/accounts` lists the account keys. Prefix any endpoint with `/api/a/<key>/` to read that account, for example `/api/a/<key>/ledger`. Requests without a key use the primary account.
+
+### Moving from the original addon
+
+This addon has a different slug from the original, so it has its own data folder.
+
+1. Make a Home Assistant backup.
+2. Stop the original **Con Edison** addon. Don't start both at once: they would both scrape and send duplicate notifications.
+3. Start this addon. On first start it copies the original's database, credentials and settings, and the ConEd Connect integration switches to this addon automatically.
+4. Once everything looks right, uninstall the original addon.
+
+If the original was still running at first start, the log says the import was skipped. Stop both addons, delete `postgres` in this addon's config folder (`/addon_configs/<slug>/`), then start this addon again.
+
 ## TTS Alerts
 
 Configure TTS (text-to-speech) in **Settings → TTS Alerts**. Messages use format `(prefix), (message)` like [Home-Energy](https://github.com/zodyking/Home-Energy).

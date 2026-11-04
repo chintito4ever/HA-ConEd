@@ -24,11 +24,81 @@ logger = logging.getLogger(__name__)
 _meter_service: Optional['MeterService'] = None
 
 
+def _digits(value: Any) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def best_aggregate(account: Any, preferred: tuple):
+    """First aggregate in `preferred` that the meter's read resolution supports."""
+    from opower import SUPPORTED_AGGREGATE_TYPES
+
+    resolution = getattr(account, "read_resolution", None)
+    if resolution is None:
+        return preferred[0]
+    supported = SUPPORTED_AGGREGATE_TYPES.get(resolution, [])
+    return next((a for a in preferred if a in supported), None)
+
+
+def usage_unit(account: Any) -> str:
+    """Display unit for a meter: kWh for electric, therms for gas."""
+    meter_type = str(getattr(account, "meter_type", "") or "").upper()
+    if meter_type == "GAS":
+        return "therms"
+    if meter_type == "WATER":
+        return "gal"
+    return "kWh"
+
+
+def match_opower_accounts(opower_accounts: List[Any], registry: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Pair each ConEd account key with one opower meter.
+
+    One ConEd account can have an electric and a gas meter; electric wins
+    because the panel's usage views were built for it. Matching order:
+    1. utility_account_id digits equal or overlap the site id or account number.
+    2. Primary takes the first remaining meter (what older versions used).
+    3. Other accounts take remaining meters in order.
+    """
+    def rank(acc):
+        return 0 if str(getattr(acc, "meter_type", "")).upper() == "ELEC" else 1
+
+    groups: Dict[str, List[Any]] = {}
+    order: List[str] = []
+    for acc in opower_accounts:
+        uid = _digits(acc.utility_account_id) or str(acc.uuid)
+        if uid not in groups:
+            groups[uid] = []
+            order.append(uid)
+        groups[uid].append(acc)
+    for uid in groups:
+        groups[uid].sort(key=rank)
+
+    result: Dict[str, Any] = {}
+    used: set = set()
+    for entry in registry:
+        ids = [d for d in (_digits(entry.get("site_id")), _digits(entry.get("number"))) if len(d) >= 6]
+        for uid in order:
+            if uid in used:
+                continue
+            if len(uid) >= 6 and any(uid == d or uid.endswith(d) or d.endswith(uid) for d in ids):
+                result[entry["key"]] = groups[uid][0]
+                used.add(uid)
+                break
+    remaining = [uid for uid in order if uid not in used]
+    unmatched = sorted(
+        (e for e in registry if e["key"] not in result),
+        key=lambda e: 0 if e["key"] == "primary" else 1,
+    )
+    for entry, uid in zip(unmatched, remaining):
+        result[entry["key"]] = groups[uid][0]
+    return result
+
+
 class MeterService:
     """Service for fetching and caching meter readings from Con Edison via Opower."""
     
     def __init__(self):
-        self.last_reading: Optional[Dict[str, Any]] = None
+        # Latest reading per ConEd account key
+        self._last_readings: Dict[str, Dict[str, Any]] = {}
         self.last_reading_time: Optional[datetime] = None
         self.config: Optional[Dict[str, Any]] = None
         self._polling_task: Optional[asyncio.Task] = None
@@ -137,6 +207,34 @@ class MeterService:
             logger.error(f"Opower login failed: {e}")
             return False
     
+    @property
+    def last_reading(self) -> Optional[Dict[str, Any]]:
+        from account_context import current_account
+        return self._last_readings.get(current_account())
+
+    @last_reading.setter
+    def last_reading(self, value: Optional[Dict[str, Any]]) -> None:
+        from account_context import current_account
+        if value is None:
+            self._last_readings.pop(current_account(), None)
+        else:
+            self._last_readings[current_account()] = value
+
+    async def _current_opower_account(self):
+        """Opower account (meter) for the current ConEd account, or None."""
+        import db
+        from account_context import current_account
+
+        accounts = await self._get_accounts()
+        if not accounts:
+            logger.error("No opower accounts found")
+            return None
+        registry = await db.get_accounts()
+        chosen = match_opower_accounts(accounts, registry).get(current_account())
+        if chosen is None:
+            logger.warning("No opower meter matched ConEd account %s", current_account())
+        return chosen
+
     async def _get_accounts(self) -> List[Any]:
         """Get accounts from opower."""
         if not self._opower:
@@ -183,28 +281,27 @@ class MeterService:
             if not await self._login():
                 return None
             
-            # Get accounts
-            accounts = await self._get_accounts()
-            if not accounts:
-                logger.error("No opower accounts found")
+            account = await self._current_opower_account()
+            if account is None:
                 return None
             
-            # Get first electric account
-            account = accounts[0]
-            
-            # Fetch last 48 hours of hourly data to ensure we get recent readings
+            # Hourly when the meter supports it; gas meters often report daily only
+            aggregate = best_aggregate(account, (AggregateType.HOUR, AggregateType.DAY))
+            if aggregate is None:
+                logger.warning("Meter %s has no hourly or daily reads", account.utility_account_id)
+                return None
             end_date = datetime.now(timezone.utc)
-            start_date = end_date - timedelta(hours=48)
+            start_date = end_date - (timedelta(hours=48) if aggregate == AggregateType.HOUR else timedelta(days=10))
             
             reads = await self._opower.async_get_cost_reads(
                 account,
-                AggregateType.HOUR,
+                aggregate,
                 start_date,
                 end_date
             )
             
             if not reads:
-                logger.warning("No hourly readings available")
+                logger.warning("No %s readings available", aggregate.value)
                 return None
             
             # Get the most recent reading (last in list)
@@ -214,8 +311,9 @@ class MeterService:
                 'start_time': latest.start_time.isoformat() if latest.start_time else None,
                 'end_time': latest.end_time.isoformat() if latest.end_time else None,
                 'value': float(latest.consumption) if latest.consumption is not None else None,
-                'unit': 'kWh',
-                'data_type': 'hourly',
+                'unit': usage_unit(account),
+                'meter_type': str(account.meter_type),
+                'data_type': 'hourly' if aggregate == AggregateType.HOUR else 'daily',
                 'fetched_at': datetime.now(timezone.utc).isoformat()
             }
             
@@ -226,7 +324,7 @@ class MeterService:
             import db
             await db.save_meter_reading_db(reading)
             
-            logger.info(f"Meter reading fetched: {reading['value']} {reading['unit']} (hourly data from {latest.end_time})")
+            logger.info(f"Meter reading fetched: {reading['value']} {reading['unit']} ({reading['data_type']} data from {latest.end_time})")
             return reading
             
         except Exception as e:
@@ -262,7 +360,16 @@ class MeterService:
             if not forecasts:
                 return None
             
-            forecast = forecasts[0]
+            account = await self._current_opower_account()
+            if account is None:
+                return None
+            forecast = next(
+                (f for f in forecasts if getattr(f.account, "uuid", None) == account.uuid),
+                None,
+            )
+            if forecast is None:
+                logger.info("No forecast for meter %s", account.utility_account_id)
+                return None
             forecast_data = {
                 'start_date': forecast.start_date.isoformat() if forecast.start_date else None,
                 'end_date': forecast.end_date.isoformat() if forecast.end_date else None,
@@ -326,13 +433,35 @@ class MeterService:
             if not await self._login():
                 return []
             
-            # Get accounts
-            accounts = await self._get_accounts()
-            if not accounts:
-                logger.error("No opower accounts found")
+            account = await self._current_opower_account()
+            if account is None:
                 return []
-            
-            account = accounts[0]
+
+            finest = best_aggregate(
+                account, (AggregateType.QUARTER_HOUR, AggregateType.HOUR, AggregateType.DAY)
+            )
+            if finest is None:
+                logger.info("Meter %s only reports per bill; no interval reads", account.utility_account_id)
+                return []
+            if finest == AggregateType.DAY:
+                # Daily meters (common for gas): store one row per day
+                end_date = datetime.now(timezone.utc)
+                start_date = end_date - timedelta(hours=max(hours, 24 * 30))
+                reads = await self._opower.async_get_cost_reads(account, AggregateType.DAY, start_date, end_date)
+                daily = [
+                    {
+                        'start_time': r.start_time.isoformat(),
+                        'end_time': r.end_time.isoformat(),
+                        'consumption': float(r.consumption) if r.consumption is not None else 0,
+                    }
+                    for r in reads or []
+                    if r.start_time and r.end_time
+                ]
+                if daily:
+                    import db
+                    await db.save_realtime_readings_db(daily)
+                    logger.info(f"Fetched {len(daily)} daily readings, stored for chart")
+                return daily
             
             # API max ~6 days per request. Fetch in chunks and merge.
             CHUNK_HOURS = 144  # 6 days per API request
@@ -344,12 +473,14 @@ class MeterService:
                 fetch_hours = min(total_hours, CHUNK_HOURS)
                 start_date = end_date - timedelta(hours=fetch_hours)
 
-                reads = await self._opower.async_get_cost_reads(
-                    account,
-                    AggregateType.QUARTER_HOUR,
-                    start_date,
-                    end_date
-                )
+                reads = []
+                if finest == AggregateType.QUARTER_HOUR:
+                    reads = await self._opower.async_get_cost_reads(
+                        account,
+                        AggregateType.QUARTER_HOUR,
+                        start_date,
+                        end_date
+                    )
 
                 # Fallback: Con Edison often provides hourly data only (no quarter-hour unless realtime enrollment)
                 if not reads:
@@ -419,11 +550,9 @@ class MeterService:
             if not await self._login():
                 return None
             
-            accounts = await self._get_accounts()
-            if not accounts:
+            account = await self._current_opower_account()
+            if account is None:
                 return None
-            
-            account = accounts[0]
             
             # Check realtime support
             has_realtime = False
@@ -479,12 +608,17 @@ class MeterService:
             while self._running:
                 try:
                     if self.is_enabled():
-                        # Latest hourly reading (data saved to DB for integration to poll)
-                        await self.fetch_reading()
-                        # 6-day data for History chart (API max); chart shows last 24h
-                        await self.fetch_quarter_hour_reads(144)
-                        # Also fetch forecast data
-                        await self.fetch_forecast()
+                        import db
+                        from account_context import use_account
+
+                        for account_key in await db.get_account_keys():
+                            with use_account(account_key):
+                                # Latest reading (data saved to DB for integration to poll)
+                                await self.fetch_reading()
+                                # 6-day data for History chart (API max); chart shows last 24h
+                                await self.fetch_quarter_hour_reads(144)
+                                # Also fetch forecast data
+                                await self.fetch_forecast()
                 except Exception as e:
                     logger.error(f"Meter polling error: {e}")
                 

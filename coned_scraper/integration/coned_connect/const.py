@@ -1,9 +1,31 @@
 """Constants for the Con Edison integration."""
 from datetime import timedelta
 
+import json
+from pathlib import Path
+
 DOMAIN = "coned_connect"
 DEFAULT_NAME = "ConEd Connect"
-DEFAULT_URL = "http://9a4bbad0-coned-scraper:8000"
+
+# The add-on writes its hostname here when it installs this integration, so
+# forks and local installs (whose slugs differ) find the right add-on.
+_UPSTREAM_HOSTNAME = "9a4bbad0-coned-scraper"
+
+
+def _addon_hostname() -> str:
+    try:
+        info = json.loads((Path(__file__).parent / "addon_info.json").read_text())
+        return info.get("hostname") or _UPSTREAM_HOSTNAME
+    except (OSError, ValueError):
+        return _UPSTREAM_HOSTNAME
+
+
+ADDON_HOSTNAME = _addon_hostname()
+ADDON_SLUG = ADDON_HOSTNAME.replace("-", "_")
+DEFAULT_URL = f"http://{ADDON_HOSTNAME}:8000"
+UPSTREAM_DEFAULT_URL = f"http://{_UPSTREAM_HOSTNAME}:8000"
+
+PRIMARY_ACCOUNT = "primary"
 
 CONF_ADDON_URL = "addon_url"
 

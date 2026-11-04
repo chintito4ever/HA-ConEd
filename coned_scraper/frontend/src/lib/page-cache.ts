@@ -9,8 +9,16 @@ export interface PageCacheEntry<T> {
   payload: T
 }
 
+import { getSelectedAccount, PRIMARY_ACCOUNT } from './account'
+
 const memory = new Map<string, PageCacheEntry<unknown>>()
 const STORAGE_PREFIX = 'ha-coned:page-cache:v1:'
+
+/** Cache key for the account the panel shows (primary keeps the original key). */
+function accountKey(key: string): string {
+  const account = getSelectedAccount()
+  return account === PRIMARY_ACCOUNT ? key : `${account}:${key}`
+}
 
 export const LEDGER_CACHE_KEY = 'ledger'
 export const HISTORY_CACHE_KEY = 'history'
@@ -19,6 +27,7 @@ export function readPageCache<T>(
   key: string,
   isPayload: (value: unknown) => value is T,
 ): PageCacheEntry<T> | null {
+  key = accountKey(key)
   const mem = memory.get(key)
   if (mem && isPayload(mem.payload)) {
     return mem as PageCacheEntry<T>
@@ -41,6 +50,7 @@ export function readPageCache<T>(
 }
 
 export function writePageCache<T>(key: string, payload: T): void {
+  key = accountKey(key)
   const entry: PageCacheEntry<T> = { savedAt: Date.now(), payload }
   memory.set(key, entry)
   try {

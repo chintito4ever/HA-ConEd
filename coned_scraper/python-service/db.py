@@ -38,8 +38,118 @@ from safe_values import aware_datetime, charge_total, safe_float
 
 logger = logging.getLogger(__name__)
 
-# Global Prisma client instance
-db = Prisma()
+from account_context import (
+    PRIMARY_ACCOUNT,
+    current_account,
+    remember_account_labels,
+    scoped_name,
+    use_account,
+)
+
+
+class _AccountScopedModel:
+    """Wrap a Prisma model so every query is limited to the current account.
+
+    direct: the model has its own accountId column.
+    via_bill: the model belongs to a Bill (BillDetails, BillDocument).
+    Lookups by primary key (find_unique/update/delete on id) pass through: ids are global.
+    """
+
+    def __init__(self, model, mode: str):
+        self._model = model
+        self._mode = mode
+
+    def _filter(self) -> Dict[str, Any]:
+        acct = current_account()
+        if self._mode == "direct":
+            return {"accountId": acct}
+        return {"bill": {"is": {"accountId": acct}}}
+
+    def _where(self, where: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        scope = self._filter()
+        if not where:
+            return scope
+        if self._mode == "direct" and "accountId" in where:
+            return where
+        if not any(k in where for k in scope):
+            return {**where, **scope}
+        return {"AND": [where, scope]}
+
+    def _with_account(self, data: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        data = dict(data or {})
+        if self._mode == "direct" and "accountId" not in data:
+            data["accountId"] = current_account()
+        return data
+
+    async def find_many(self, **kwargs):
+        kwargs["where"] = self._where(kwargs.get("where"))
+        return await self._model.find_many(**kwargs)
+
+    async def find_first(self, **kwargs):
+        kwargs["where"] = self._where(kwargs.get("where"))
+        return await self._model.find_first(**kwargs)
+
+    async def find_first_or_raise(self, **kwargs):
+        kwargs["where"] = self._where(kwargs.get("where"))
+        return await self._model.find_first_or_raise(**kwargs)
+
+    async def count(self, **kwargs):
+        kwargs["where"] = self._where(kwargs.get("where"))
+        return await self._model.count(**kwargs)
+
+    async def delete_many(self, **kwargs):
+        kwargs["where"] = self._where(kwargs.get("where"))
+        return await self._model.delete_many(**kwargs)
+
+    async def update_many(self, **kwargs):
+        kwargs["where"] = self._where(kwargs.get("where"))
+        return await self._model.update_many(**kwargs)
+
+    async def create(self, **kwargs):
+        kwargs["data"] = self._with_account(kwargs.get("data"))
+        return await self._model.create(**kwargs)
+
+    async def create_many(self, **kwargs):
+        kwargs["data"] = [self._with_account(d) for d in kwargs.get("data") or []]
+        return await self._model.create_many(**kwargs)
+
+    async def upsert(self, **kwargs):
+        data = dict(kwargs.get("data") or {})
+        if "create" in data:
+            data["create"] = self._with_account(data["create"])
+            kwargs["data"] = data
+        return await self._model.upsert(**kwargs)
+
+    def __getattr__(self, name):
+        # find_unique, update, delete by id: ids are unique across accounts
+        return getattr(self._model, name)
+
+
+class _AccountScopedPrisma:
+    """The Prisma client, with per-account models limited to the current account."""
+
+    _DIRECT = {"bill", "payment", "accountbalancehistory", "scrapeddata", "realtimereading"}
+    _VIA_BILL = {"billdetails", "billdocument"}
+
+    def __init__(self, client: Prisma):
+        self._client = client
+
+    @property
+    def unscoped(self) -> Prisma:
+        """The raw client, for queries that must see every account."""
+        return self._client
+
+    def __getattr__(self, name):
+        attr = getattr(self._client, name)
+        if name in self._DIRECT:
+            return _AccountScopedModel(attr, "direct")
+        if name in self._VIA_BILL:
+            return _AccountScopedModel(attr, "via_bill")
+        return attr
+
+
+# Global Prisma client instance (queries on per-account models follow account_context)
+db = _AccountScopedPrisma(Prisma())
 
 def utc_now() -> datetime:
     """Get current UTC time"""
@@ -119,10 +229,16 @@ async def run_migrations():
                 ON payment_petitions(payment_id)
             """)
             
-            # Migration: Unique constraint on realtime_readings for upsert/append
+            # Migration: readings are unique per account (multi-account). The old
+            # (start_time, end_time) index would block a second account's readings.
+            await conn.execute("DROP INDEX IF EXISTS realtime_readings_start_end_key")
             await conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS realtime_readings_start_end_key 
-                ON realtime_readings(start_time, end_time)
+                ALTER TABLE realtime_readings
+                ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'primary'
+            """)
+            await conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS realtime_readings_account_start_end_key
+                ON realtime_readings(account_id, start_time, end_time)
             """)
             
             logger.info("Database migrations completed successfully")
@@ -879,6 +995,9 @@ async def upsert_payment(
             bill_cycle = bill.billCycleDate.strftime("%m/%d/%Y") if bill.billCycleDate else ""
     
     payment_hash = generate_payment_hash(payment_date, amount, description, bill_cycle)
+    if current_account() != PRIMARY_ACCOUNT:
+        # paymentHash is unique across all accounts; two accounts can pay the same amount the same day
+        payment_hash = hashlib.sha256(f"{current_account()}|{payment_hash}".encode()).hexdigest()
     amount_numeric = parse_amount(amount)
     payment_dt = parse_date(payment_date) or utc_now()
     
@@ -1288,11 +1407,12 @@ async def get_unverified_payments_with_no_claim_responses() -> List[Dict[str, An
     conn = await _raw_conn()
     try:
         rows = await conn.fetch("""
-            SELECT p.id, p.payment_date, p.amount, p.description, p.bill_id
+            SELECT p.id, p.payment_date, p.amount, p.description, p.bill_id, p.first_scraped_at
             FROM payments p
             LEFT JOIN payment_claim_responses pcr ON pcr.payment_id = p.id
             WHERE p.payee_status = 'unverified' AND pcr.id IS NULL
-        """)
+              AND p.account_id = $1
+        """, current_account())
         return [
             {
                 "id": r["id"],
@@ -1301,6 +1421,7 @@ async def get_unverified_payments_with_no_claim_responses() -> List[Dict[str, An
                 "amount_numeric": float(r["amount"]),
                 "description": r["description"],
                 "bill_id": r["bill_id"],
+                "first_scraped_at": r["first_scraped_at"],
             }
             for r in rows
         ]
@@ -1323,13 +1444,13 @@ async def get_payments_for_claim_resend(claim_resend_delay_hours: int = 24) -> L
                    MAX(pcr.responded_at) as last_response
             FROM payments p
             JOIN payment_claim_responses pcr ON pcr.payment_id = p.id
-            WHERE p.payee_status = 'unverified'
+            WHERE p.payee_status = 'unverified' AND p.account_id = $1
             GROUP BY p.id, p.payment_date, p.amount, p.description
             HAVING COUNT(DISTINCT pcr.payee_id) = (
                 SELECT COUNT(*) FROM payee_users WHERE notifications_enabled = true AND notify_service IS NOT NULL
             )
             AND NOT EXISTS (SELECT 1 FROM payment_claim_responses WHERE payment_id = p.id AND claimed = true)
-        """)
+        """, current_account())
         result = []
         from datetime import timedelta
         cutoff = utc_now() - timedelta(hours=claim_resend_delay_hours)
@@ -2184,21 +2305,47 @@ async def get_scrape_history(limit: int = 50) -> List[Dict[str, Any]]:
 # App Settings
 # =============================================================================
 
+# Settings that hold state for one ConEd account. Other keys (credentials, app
+# settings, TTS config, schedule, meter login) are shared by all accounts.
+PER_ACCOUNT_SETTING_KEYS = {
+    "late_fee_reported",
+    "late_fee_reported_bill_id",
+    "meter_reading_cache",
+    "meter_forecast_cache",
+    "payment_state",
+    "tts_payment_state",
+    "tts_bill_state",
+    "calculation_switches",
+    "rollover_clear",
+    "payee_balance_reminder_dedup",
+    "underpayment_streak_tts_dedup",
+    "claims_baseline",
+}
+
+
+def _setting_storage_key(key: str) -> str:
+    """Storage key for a setting. Per-account keys get an @<account> suffix (not for primary)."""
+    if key in PER_ACCOUNT_SETTING_KEYS:
+        return scoped_name(key)
+    return key
+
+
 async def get_app_setting(key: str) -> Optional[Any]:
     """Get app setting value"""
     await ensure_connected()
-    
-    setting = await db.appsetting.find_unique(where={"key": key})
-    
+
+    setting = await db.appsetting.find_unique(where={"key": _setting_storage_key(key)})
+
     if not setting:
         return None
-    
+
     return setting.value
 
 async def set_app_setting(key: str, value: Any):
     """Set app setting value"""
     await ensure_connected()
-    
+    key = _setting_storage_key(key)
+
     existing = await db.appsetting.find_unique(where={"key": key})
     
     # Wrap value with Json() for Prisma JSON fields
@@ -2208,6 +2355,158 @@ async def set_app_setting(key: str, value: Any):
         await db.appsetting.update(where={"key": key}, data={"value": json_value})
     else:
         await db.appsetting.create(data={"key": key, "value": json_value})
+
+# =============================================================================
+# ConEd accounts (one login can hold several)
+# =============================================================================
+
+ACCOUNTS_SETTING_KEY = "coned_accounts"
+
+
+def _default_account() -> Dict[str, Any]:
+    return {
+        "key": PRIMARY_ACCOUNT,
+        "site_id": None,
+        "number": None,
+        "address": None,
+        "status": None,
+        "label": "Con Edison",
+    }
+
+
+async def get_accounts() -> List[Dict[str, Any]]:
+    """Known accounts, primary first. Before the first multi-account scrape this is just primary."""
+    raw = await get_app_setting(ACCOUNTS_SETTING_KEY)
+    accounts = raw.get("accounts") if isinstance(raw, dict) else None
+    if not accounts:
+        remember_account_labels([_default_account()])
+        return [_default_account()]
+    accounts = [a for a in accounts if isinstance(a, dict) and a.get("key")]
+    accounts.sort(key=lambda a: 0 if a["key"] == PRIMARY_ACCOUNT else 1)
+    accounts = accounts or [_default_account()]
+    remember_account_labels(accounts)
+    return accounts
+
+
+async def get_account(key: str) -> Optional[Dict[str, Any]]:
+    for a in await get_accounts():
+        if a["key"] == key:
+            return a
+    return None
+
+
+async def get_account_keys() -> List[str]:
+    return [a["key"] for a in await get_accounts()]
+
+
+async def resolve_account_key(value: Optional[str]) -> Optional[str]:
+    """Match a request's account value (key, site id or shown account number) to a known key."""
+    if not value:
+        return PRIMARY_ACCOUNT
+    from account_context import account_digits
+    value = str(value).strip()
+    digits = account_digits(value)
+    for a in await get_accounts():
+        if value == a["key"] or (digits and digits in (
+            a["key"], account_digits(a.get("site_id")), account_digits(a.get("number"))
+        )):
+            return a["key"]
+    return None
+
+
+async def save_accounts(accounts: List[Dict[str, Any]]) -> None:
+    await set_app_setting(ACCOUNTS_SETTING_KEY, {"accounts": accounts})
+    remember_account_labels(accounts)
+
+
+async def update_account_label(key: str, label: str) -> Optional[Dict[str, Any]]:
+    accounts = await get_accounts()
+    for a in accounts:
+        if a["key"] == key:
+            a["label"] = (label or "").strip() or a.get("address") or a["key"]
+            await save_accounts(accounts)
+            return a
+    return None
+
+
+async def account_of_payment(payment_id: int) -> Optional[str]:
+    """Account a payment belongs to (payment ids are unique across accounts)."""
+    await ensure_connected()
+    payment = await db.unscoped.payment.find_unique(where={"id": payment_id})
+    return payment.accountId if payment else None
+
+
+async def primary_bill_overlap(ledger: List[Dict[str, Any]]) -> int:
+    """How many bills in a scraped ledger already exist under the primary account."""
+    keys = set()
+    for item in ledger or []:
+        if item.get("type") != "bill":
+            continue
+        cycle = parse_date(item.get("bill_cycle_date") or "")
+        if cycle:
+            keys.add((cycle.date(), normalize_month_range(item.get("month_range"))))
+    if not keys:
+        return 0
+    with use_account(PRIMARY_ACCOUNT):
+        bills = await db.bill.find_many()
+    return sum(
+        1 for b in bills
+        if b.billCycleDate and (b.billCycleDate.date(), normalize_month_range(b.monthRange)) in keys
+    )
+
+
+async def primary_has_bills() -> bool:
+    with use_account(PRIMARY_ACCOUNT):
+        return await db.bill.count() > 0
+
+
+async def register_site_accounts(
+    site_accounts: List[Dict[str, Any]],
+    primary_site_id: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Merge accounts found on coned.com into the registry.
+
+    site_accounts: [{site_id, number, address, status}]. primary_site_id is the
+    account whose data is stored as "primary" (what older versions scraped).
+    Labels the user set are kept. Accounts no longer on the site stay listed so
+    their history is not lost.
+    """
+    from account_context import account_digits
+    existing = {a["key"]: a for a in await get_accounts()}
+    existing_primary = existing.get(PRIMARY_ACCOUNT, _default_account())
+    # Once primary is tied to a site account, keep it tied.
+    if existing_primary.get("site_id"):
+        primary_site_id = existing_primary["site_id"]
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    for sa in site_accounts:
+        site_id = account_digits(sa.get("site_id"))
+        if not site_id:
+            continue
+        key = PRIMARY_ACCOUNT if site_id == account_digits(primary_site_id) else site_id
+        prev = existing.get(key, {})
+        address = sa.get("address") or prev.get("address")
+        prev_label = prev.get("label")
+        if not prev_label or prev_label == _default_account()["label"]:
+            prev_label = None
+        merged[key] = {
+            "key": key,
+            "site_id": site_id,
+            "number": sa.get("number") or prev.get("number"),
+            "address": address,
+            "status": sa.get("status") or prev.get("status"),
+            "label": prev_label or address or f"Account {sa.get('number') or site_id}",
+        }
+    for key, prev in existing.items():
+        if key not in merged and (key != PRIMARY_ACCOUNT or prev.get("site_id")):
+            merged[key] = prev
+    if PRIMARY_ACCOUNT not in merged:
+        merged[PRIMARY_ACCOUNT] = existing_primary
+
+    accounts = sorted(merged.values(), key=lambda a: 0 if a["key"] == PRIMARY_ACCOUNT else 1)
+    await save_accounts(accounts)
+    return accounts
+
 
 async def get_tts_config_db() -> Optional[Dict[str, Any]]:
     """Get TTS config from database"""
@@ -2376,26 +2675,19 @@ async def save_realtime_readings_db(readings: List[Dict[str, Any]]):
         except (ValueError, TypeError):
             continue
         consumption = float(r.get("consumption", 0) or 0)
-        try:
-            await db.realtimereading.upsert(
-                where={"startTime_endTime": {"startTime": start_dt, "endTime": end_dt}},
-                create={"startTime": start_dt, "endTime": end_dt, "consumption": consumption},
-                update={"consumption": consumption},
+        # find_first + create/update, limited to the current account by the scoped client
+        existing = await db.realtimereading.find_first(
+            where={"startTime": start_dt, "endTime": end_dt}
+        )
+        if existing:
+            await db.realtimereading.update(
+                where={"id": existing.id},
+                data={"consumption": consumption},
             )
-        except Exception:
-            # Fallback: find_first + create/update (compound unique name may vary by Prisma version)
-            existing = await db.realtimereading.find_first(
-                where={"startTime": start_dt, "endTime": end_dt}
+        else:
+            await db.realtimereading.create(
+                data={"startTime": start_dt, "endTime": end_dt, "consumption": consumption},
             )
-            if existing:
-                await db.realtimereading.update(
-                    where={"id": existing.id},
-                    data={"consumption": consumption},
-                )
-            else:
-                await db.realtimereading.create(
-                    data={"startTime": start_dt, "endTime": end_dt, "consumption": consumption},
-                )
 
 # =============================================================================
 # Credentials (migrated from file to database)

@@ -8,11 +8,114 @@ import db
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+from account_context import PRIMARY_ACCOUNT, current_account, scoped_name, use_account
+
 # Single screenshot filename that gets overwritten each scrape
 # Captures the page state where account balance was found
 SCREENSHOT_FILENAME = "account_balance.png"
 # Live preview screenshot for console display
 LIVE_PREVIEW_FILENAME = "live_preview.png"
+
+MY_ACCOUNT_URL = "https://www.coned.com/en/accounts-billing/my-account"
+
+# coned.com account (data-account id) the browser is scraping. Every page
+# load adds ?account=<id>, which is how coned.com's own account switcher
+# picks an account. None = whatever account the site shows.
+_active_site_account = None
+
+
+def _with_account(url: str) -> str:
+    """URL for the account being scraped (coned.com switches accounts with ?account=)."""
+    if not _active_site_account or "account=" in url:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}account={_active_site_account}"
+
+
+def _screenshot_filename() -> str:
+    """Balance screenshot for the current account: account_balance.png or account_balance@<key>.png."""
+    return scoped_name("account_balance") + ".png"
+
+
+async def discover_site_accounts(page) -> list:
+    """Accounts in coned.com's "My Service Accounts" dropdown.
+
+    Returns [{site_id, number, address, status, selected}]. Empty when the
+    login has no dropdown (one account).
+    """
+    try:
+        items = await page.evaluate(
+            """() => {
+                const seen = new Map();
+                for (const li of document.querySelectorAll('li.js-dropdown-item[data-account]')) {
+                    const id = (li.dataset.account || '').trim();
+                    if (!id) continue;
+                    const text = sel => ((li.querySelector(sel) || {}).textContent || '').trim();
+                    const prev = seen.get(id);
+                    const entry = {
+                        site_id: id,
+                        number: text('.account-dropdown-logged-in__account-number .no-translate')
+                            || text('[class*="account-number"] .no-translate'),
+                        address: text('[class*="__address"]'),
+                        status: text('[class*="account-state"]'),
+                        selected: li.getAttribute('aria-selected') === 'true',
+                    };
+                    if (!prev) seen.set(id, entry);
+                    else if (entry.selected) prev.selected = true;
+                }
+                return [...seen.values()];
+            }"""
+        )
+    except Exception as e:
+        await db.add_log("warning", f"Could not read the account list: {e}")
+        return []
+    return [i for i in items or [] if i.get("site_id")]
+
+
+async def plan_account_scrape(page, site_accounts: list) -> list:
+    """Decide which coned.com account maps to which stored account. Returns [(key, site_id)].
+
+    Data saved before multi-account support is the "primary" account. The
+    first time several accounts show up, primary is tied to the account whose
+    bill history matches the stored bills (or, with no stored bills, the
+    account coned.com selected at login). Later runs reuse that.
+    """
+    global _active_site_account
+    if not site_accounts:
+        return [(PRIMARY_ACCOUNT, None)]
+
+    registry = await db.get_accounts()
+    primary = next((a for a in registry if a["key"] == PRIMARY_ACCOUNT), {})
+    site_ids = {a["site_id"] for a in site_accounts}
+    primary_site_id = primary.get("site_id")
+
+    if not primary_site_id or primary_site_id not in site_ids:
+        default = next((a for a in site_accounts if a.get("selected")), site_accounts[0])
+        primary_site_id = default["site_id"]
+        if len(site_accounts) > 1 and await db.primary_has_bills():
+            await db.add_log("info", f"Found {len(site_accounts)} ConEd accounts; matching stored bills to one of them")
+            best, best_overlap = None, 0
+            for sa in site_accounts:
+                _active_site_account = sa["site_id"]
+                try:
+                    history = await scrape_bill_history(page)
+                    overlap = await db.primary_bill_overlap(history.get("ledger") or [])
+                except Exception as e:
+                    await db.add_log("warning", f"Bill match check failed for {sa.get('address') or sa['site_id']}: {e}")
+                    overlap = 0
+                await db.add_log("info", f"{sa.get('address') or sa['site_id']}: {overlap} stored bill(s) match")
+                if overlap > best_overlap:
+                    best, best_overlap = sa, overlap
+            _active_site_account = None
+            if best:
+                primary_site_id = best["site_id"]
+        accounts = await db.register_site_accounts(site_accounts, primary_site_id)
+        names = ", ".join(f"{a['label']} [{a['key']}]" for a in accounts)
+        await db.add_log("success", f"ConEd accounts: {names}")
+    else:
+        accounts = await db.register_site_accounts(site_accounts, primary_site_id)
+
+    return [(a["key"], a["site_id"]) for a in accounts if a.get("site_id") in site_ids]
 
 async def type_text_slowly(page, selector: str, text: str, delay: int = 50):
     """
@@ -409,80 +512,37 @@ async def perform_login(username: str, password: str, totp_code: str, test_only:
                 }
             
             # Scrape data after successful login
+            global _active_site_account
             scraped_data = {}
+            scraped_accounts = {}
             if is_success:
                 try:
                     await db.add_log("info", "Starting data scraping...")
                     # Navigate to account page if not already there
-                    account_url = "https://www.coned.com/en/accounts-billing/my-account"
-                    if account_url not in current_url:
-                        await db.add_log("info", f"Navigating to account page: {account_url}")
-                        await page.goto(account_url, wait_until="networkidle", timeout=30000)
+                    if MY_ACCOUNT_URL not in current_url:
+                        await db.add_log("info", f"Navigating to account page: {MY_ACCOUNT_URL}")
+                        await page.goto(MY_ACCOUNT_URL, wait_until="networkidle", timeout=30000)
                         await asyncio.sleep(3)  # Wait for page to load
-                    
-                    scraped_data = await scrape_account_data(page, context)
-                    
-                    # Scrape bill history ledger
-                    bill_history = await scrape_bill_history(page)
-                    scraped_data["bill_history"] = bill_history
-                    
-                    # Screenshot was already taken in scrape_account_data after finding balance
-                    # Just store the filename in scraped_data
-                    scraped_data["screenshot_path"] = SCREENSHOT_FILENAME
-                    
-                    await db.add_log("success", f"Data scraping completed successfully")
-                    
-                    scrape_id, recheck_info = await db.save_scraped_data(scraped_data, "success", None, SCREENSHOT_FILENAME)
-                    if recheck_info:
-                        await db.add_log("info", "Balance validation failed, doing balance recheck...")
-                        logger.info("Balance validation failed, doing balance recheck...")
-                        # Page is on bill history - navigate back to account page for balance selectors
-                        account_url = "https://www.coned.com/en/accounts-billing/my-account"
-                        await page.goto(account_url, wait_until="networkidle", timeout=30000)
-                        await asyncio.sleep(2)
-                        rescraped = await scrape_account_data(page, context)
-                        rescraped_balance = rescraped.get("account_balance") if rescraped else None
-                        await db.process_balance_recheck(
-                            rescraped_balance,
-                            recheck_info["scraped"],
-                            recheck_info["expected"],
-                            recheck_info["bill_id"],
-                        )
 
-                    # Secondary PDF scrape (independent - failures do not affect main scrape)
-                    try:
-                        pdf_results = await scrape_bill_pdfs(page, context)
-                        if pdf_results:
-                            from pdf_utils import download_and_store_pdf
-                            for month_range, bill_cycle_date, pdf_url in pdf_results:
-                                label = (
-                                    f"{month_range} ({bill_cycle_date})"
-                                    if bill_cycle_date
-                                    else month_range
-                                )
-                                try:
-                                    bill_id = await db.get_bill_id_by_month_range(
-                                        month_range, bill_cycle_date
-                                    )
-                                    if bill_id:
-                                        await download_and_store_pdf(pdf_url, bill_id)
-                                        await db.add_log("success", f"Auto-downloaded PDF for {label}")
-                                    else:
-                                        await db.add_log(
-                                            "warning",
-                                            f"No bill found for {label}, skipped PDF",
-                                        )
-                                except Exception as dl_e:
-                                    await db.add_log(
-                                        "warning",
-                                        f"PDF download failed for {label}: {dl_e}",
-                                    )
-                        elif pdf_results is not None:
-                            await db.add_log("info", "PDF scrape: No new PDF URLs to download")
-                    except Exception as pdf_e:
-                        await db.add_log("warning", f"PDF scrape failed (main scrape unaffected): {pdf_e}")
-                        logger.warning(f"PDF scrape failed: {pdf_e}")
+                    site_accounts = await discover_site_accounts(page)
+                    plan = await plan_account_scrape(page, site_accounts)
+                    if len(plan) > 1:
+                        await db.add_log("info", f"Scraping {len(plan)} ConEd accounts")
+
+                    for account_key, site_id in plan:
+                        _active_site_account = site_id
+                        with use_account(account_key):
+                            try:
+                                scraped_accounts[account_key] = await _scrape_current_account(page, context, len(plan) > 1)
+                            except Exception as e:
+                                error_msg = f"Data scraping failed for account {account_key}: {str(e)}"
+                                await db.add_log("error", error_msg)
+                                logger.error(error_msg)
+                                await db.save_scraped_data({}, "error", error_msg, None)
+                    _active_site_account = None
+                    scraped_data = scraped_accounts.get(PRIMARY_ACCOUNT) or next(iter(scraped_accounts.values()), {})
                 except Exception as e:
+                    _active_site_account = None
                     error_msg = f"Data scraping failed: {str(e)}"
                     await db.add_log("error", error_msg)
                     logger.error(error_msg)
@@ -495,7 +555,8 @@ async def perform_login(username: str, password: str, totp_code: str, test_only:
                 "success": is_success,
                 "url": current_url,
                 "screenshot": "login_result.png",
-                "data": scraped_data
+                "data": scraped_data,
+                "accounts": scraped_accounts,
             }
             
         except PlaywrightTimeoutError as e:
@@ -518,6 +579,80 @@ async def perform_login(username: str, password: str, totp_code: str, test_only:
             except Exception:
                 logger.warning("Browser close failed after cancellation")
             raise
+
+async def _scrape_current_account(page, context, announce: bool = False) -> dict:
+    """Scrape and save balance, bill history and PDFs for the current account."""
+    if announce:
+        acct = await db.get_account(current_account())
+        await db.add_log("info", f"Scraping account: {(acct or {}).get('label') or current_account()}")
+    if _active_site_account:
+        await page.goto(_with_account(MY_ACCOUNT_URL), wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(3)
+
+    scraped_data = await scrape_account_data(page, context)
+
+    # Scrape bill history ledger
+    bill_history = await scrape_bill_history(page)
+    scraped_data["bill_history"] = bill_history
+
+    # Screenshot was already taken in scrape_account_data after finding balance
+    # Just store the filename in scraped_data
+    scraped_data["screenshot_path"] = _screenshot_filename()
+
+    await db.add_log("success", f"Data scraping completed successfully")
+
+    scrape_id, recheck_info = await db.save_scraped_data(scraped_data, "success", None, _screenshot_filename())
+    if recheck_info:
+        await db.add_log("info", "Balance validation failed, doing balance recheck...")
+        logger.info("Balance validation failed, doing balance recheck...")
+        # Page is on bill history - navigate back to account page for balance selectors
+        await page.goto(_with_account(MY_ACCOUNT_URL), wait_until="networkidle", timeout=30000)
+        await asyncio.sleep(2)
+        rescraped = await scrape_account_data(page, context)
+        rescraped_balance = rescraped.get("account_balance") if rescraped else None
+        await db.process_balance_recheck(
+            rescraped_balance,
+            recheck_info["scraped"],
+            recheck_info["expected"],
+            recheck_info["bill_id"],
+        )
+
+    # Secondary PDF scrape (independent - failures do not affect main scrape)
+    try:
+        pdf_results = await scrape_bill_pdfs(page, context)
+        if pdf_results:
+            from pdf_utils import download_and_store_pdf
+            for month_range, bill_cycle_date, pdf_url in pdf_results:
+                label = (
+                    f"{month_range} ({bill_cycle_date})"
+                    if bill_cycle_date
+                    else month_range
+                )
+                try:
+                    bill_id = await db.get_bill_id_by_month_range(
+                        month_range, bill_cycle_date
+                    )
+                    if bill_id:
+                        await download_and_store_pdf(pdf_url, bill_id)
+                        await db.add_log("success", f"Auto-downloaded PDF for {label}")
+                    else:
+                        await db.add_log(
+                            "warning",
+                            f"No bill found for {label}, skipped PDF",
+                        )
+                except Exception as dl_e:
+                    await db.add_log(
+                        "warning",
+                        f"PDF download failed for {label}: {dl_e}",
+                    )
+        elif pdf_results is not None:
+            await db.add_log("info", "PDF scrape: No new PDF URLs to download")
+    except Exception as pdf_e:
+        await db.add_log("warning", f"PDF scrape failed (main scrape unaffected): {pdf_e}")
+        logger.warning(f"PDF scrape failed: {pdf_e}")
+
+    return scraped_data
+
 
 async def scrape_account_data(page, context):
     """
@@ -579,9 +714,9 @@ async def scrape_account_data(page, context):
                 from data_config import DATA_DIR
                 screenshot_dir = DATA_DIR
                 screenshot_dir.mkdir(parents=True, exist_ok=True)
-                screenshot_path = screenshot_dir / SCREENSHOT_FILENAME
+                screenshot_path = screenshot_dir / _screenshot_filename()
                 await page.screenshot(path=str(screenshot_path), full_page=False)
-                await db.add_log("info", f"Screenshot saved: {SCREENSHOT_FILENAME}")
+                await db.add_log("info", f"Screenshot saved: {_screenshot_filename()}")
             except Exception as e:
                 await db.add_log("warning", f"Failed to save screenshot: {str(e)}")
             
@@ -653,7 +788,7 @@ async def scrape_pdf_bill_url(page, context):
         current_url = page.url
         if account_url not in current_url:
             await db.add_log("info", f"Navigating to account page for PDF: {account_url}")
-            await page.goto(account_url, wait_until="networkidle", timeout=30000)
+            await page.goto(_with_account(account_url), wait_until="networkidle", timeout=30000)
             await asyncio.sleep(3)
         
         await take_live_preview(page, "Looking for PDF link")
@@ -916,7 +1051,7 @@ async def scrape_bill_pdfs(page, context) -> list:
 
         # Navigate to bill history
         await db.add_log("info", f"PDF scrape: Navigating to {BILL_HISTORY_URL}")
-        await page.goto(BILL_HISTORY_URL, wait_until="networkidle", timeout=30000)
+        await page.goto(_with_account(BILL_HISTORY_URL), wait_until="networkidle", timeout=30000)
         await asyncio.sleep(3)
 
         bill_items = await page.locator(".js-bill-item, .billing-payment-item--bill").all()
@@ -957,7 +1092,7 @@ async def scrape_bill_pdfs(page, context) -> list:
             try:
                 # Ensure we're on bill history (may have navigated away)
                 if BILL_HISTORY_URL not in page.url:
-                    await page.goto(BILL_HISTORY_URL, wait_until="domcontentloaded", timeout=15000)
+                    await page.goto(_with_account(BILL_HISTORY_URL), wait_until="domcontentloaded", timeout=15000)
                     await asyncio.sleep(2)
 
                 item = await _find_bill_row_by_identity(
@@ -1003,12 +1138,12 @@ async def scrape_bill_pdfs(page, context) -> list:
                                             pdf_url = page.url
                                             await db.add_log("success", f"PDF scrape: Captured URL for {label}")
                                             break
-                                    await page.goto(BILL_HISTORY_URL, wait_until="domcontentloaded", timeout=15000)
+                                    await page.goto(_with_account(BILL_HISTORY_URL), wait_until="domcontentloaded", timeout=15000)
                                     await asyncio.sleep(2)
                                 except Exception as e:
                                     await db.add_log("warning", f"PDF scrape same-tab failed for {label}: {e}")
                                     try:
-                                        await page.goto(BILL_HISTORY_URL, wait_until="domcontentloaded", timeout=15000)
+                                        await page.goto(_with_account(BILL_HISTORY_URL), wait_until="domcontentloaded", timeout=15000)
                                     except Exception:
                                         pass
                                 break
@@ -1091,7 +1226,7 @@ async def scrape_bill_history(page):
         bill_history_url = "https://www.coned.com/en/accounts-billing/my-account/bill-history-assistance"
         await db.add_log("info", f"Navigating to bill history page: {bill_history_url}")
         
-        await page.goto(bill_history_url, wait_until="networkidle", timeout=30000)
+        await page.goto(_with_account(bill_history_url), wait_until="networkidle", timeout=30000)
         await asyncio.sleep(3)  # Wait for page to load
         
         # Click the Payments checkbox using xpath

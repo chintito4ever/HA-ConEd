@@ -10,6 +10,36 @@ bashio::log.info "ConEd Scraper initializing..."
 export DATABASE_URL="postgresql://coned:coned@localhost:5432/coned"
 export DATA_DIR=/config
 
+# ==============================================================================
+# One-time import from the original Con Edison add-on
+# This add-on's slug (and so its /config folder) differs from the original's.
+# On first start, copy the original's data so bills, payees and settings carry
+# over. Runs only while this add-on has no database yet and the original is
+# stopped (a running PostgreSQL can't be copied safely).
+# ==============================================================================
+OWN_SLUG="$(hostname | tr '-' '_')"
+if [ ! -f /config/postgres/data/PG_VERSION ] && [ ! -f /config/.imported_from_original ] && [ -d /addon_configs ]; then
+    for SRC in /addon_configs/*_coned_scraper; do
+        [ -d "$SRC" ] || continue
+        [ "$(basename "$SRC")" = "$OWN_SLUG" ] && continue
+        [ -f "$SRC/postgres/data/PG_VERSION" ] || continue
+        if [ -f "$SRC/postgres/data/postmaster.pid" ]; then
+            bashio::log.warning "Found data from $(basename "$SRC") but its database is running or was not shut down cleanly."
+            bashio::log.warning "To import it: stop that add-on, stop this one, delete this add-on's postgres folder, then start this add-on."
+            continue
+        fi
+        bashio::log.info "Importing data from $(basename "$SRC")..."
+        if cp -a "$SRC/." /config/; then
+            touch /config/.imported_from_original
+            bashio::log.info "Imported bills, payees and settings from $(basename "$SRC")"
+        else
+            bashio::log.warning "Import from $(basename "$SRC") failed; starting with an empty database"
+            rm -rf /config/postgres
+        fi
+        break
+    done
+fi
+
 # Create necessary directories
 mkdir -p /config/postgres/data
 mkdir -p /config/bill_documents
@@ -29,6 +59,8 @@ if [ -d "$INTEGRATION_SRC" ]; then
     # Remove existing to avoid nested folder issue, then copy fresh
     rm -rf "$INTEGRATION_DST"
     cp -r "$INTEGRATION_SRC" "$INTEGRATION_DST"
+    # Tell the integration which add-on installed it (slug differs for forks/local installs)
+    echo "{\"hostname\": \"$(hostname)\"}" > "$INTEGRATION_DST/addon_info.json"
     bashio::log.info "Integration installed to $INTEGRATION_DST"
 else
     bashio::log.warning "Integration source not found at $INTEGRATION_SRC"

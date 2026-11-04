@@ -11,7 +11,13 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, Event
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
-from .const import DOMAIN, CONF_ADDON_URL
+from .const import (
+    CONF_ADDON_URL,
+    DEFAULT_URL,
+    DOMAIN,
+    PRIMARY_ACCOUNT,
+    UPSTREAM_DEFAULT_URL,
+)
 from .coordinator import ConEdisonDataUpdateCoordinator
 
 if TYPE_CHECKING:
@@ -55,15 +61,49 @@ def _create_payment_claim_handler(hass: HomeAssistant, addon_url: str) -> Callab
     return handler
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Con Edison from a config entry."""
-    addon_url = entry.data[CONF_ADDON_URL]
+async def _fetch_accounts(hass: HomeAssistant, addon_url: str) -> list[dict]:
+    """ConEd accounts known to the add-on. Older add-ons without /api/accounts have one."""
+    session = async_get_clientsession(hass)
+    try:
+        async with session.get(
+            f"{addon_url.rstrip('/')}/api/accounts",
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                accounts = [a for a in data.get("accounts") or [] if a.get("key")]
+                if accounts:
+                    return accounts
+    except Exception as err:
+        _LOGGER.debug("Could not list ConEd accounts: %s", err)
+    return [{"key": PRIMARY_ACCOUNT, "label": None}]
 
-    coordinator = ConEdisonDataUpdateCoordinator(hass, addon_url)
-    await coordinator.async_config_entry_first_refresh()
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Con Edison from a config entry: one device per ConEd account."""
+    addon_url = entry.data[CONF_ADDON_URL]
+    if addon_url.rstrip("/") == UPSTREAM_DEFAULT_URL and DEFAULT_URL != UPSTREAM_DEFAULT_URL:
+        # This copy was installed by a fork of the add-on (different hostname).
+        # Point the existing entry at it so entities and their history are kept.
+        _LOGGER.info("Switching ConEd Connect from %s to %s", addon_url, DEFAULT_URL)
+        addon_url = DEFAULT_URL
+        hass.config_entries.async_update_entry(entry, data={**entry.data, CONF_ADDON_URL: addon_url})
+
+    accounts = await _fetch_accounts(hass, addon_url)
+    multiple = len(accounts) > 1
+    coordinators: dict[str, ConEdisonDataUpdateCoordinator] = {}
+    for account in accounts:
+        coordinator = ConEdisonDataUpdateCoordinator(
+            hass,
+            addon_url,
+            account["key"],
+            account.get("label") if multiple else None,
+        )
+        await coordinator.async_config_entry_first_refresh()
+        coordinators[account["key"]] = coordinator
 
     hass.data.setdefault(DOMAIN, {})
-    hass.data[DOMAIN][entry.entry_id] = coordinator
+    hass.data[DOMAIN][entry.entry_id] = coordinators
 
     handler = _create_payment_claim_handler(hass, addon_url)
     unsub_mobile = hass.bus.async_listen("mobile_app_notification_action", handler)

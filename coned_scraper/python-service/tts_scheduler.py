@@ -378,19 +378,25 @@ class TTSScheduler:
             logger.warning("No media player configured for scheduled TTS")
             return
         
-        message = await self._build_bill_summary_message()
-        if not message:
-            logger.warning("No TTS message generated")
-            return
-        
-        try:
-            success, err = await speak_from_config(message, tts_config)
-            if success:
-                logger.info("Scheduled TTS sent successfully")
-            else:
-                logger.error(f"Scheduled TTS failed: {err}")
-        except Exception as e:
-            logger.error(f"Error sending scheduled TTS: {e}")
+        import db
+        from account_context import use_account
+
+        # One announcement per ConEd account
+        for account_key in await db.get_account_keys():
+            with use_account(account_key):
+                message = await self._build_bill_summary_message()
+                if not message:
+                    logger.warning("No TTS message generated")
+                    continue
+
+                try:
+                    success, err = await speak_from_config(message, tts_config)
+                    if success:
+                        logger.info("Scheduled TTS sent successfully")
+                    else:
+                        logger.error(f"Scheduled TTS failed: {err}")
+                except Exception as e:
+                    logger.error(f"Error sending scheduled TTS: {e}")
     
     async def _build_bill_summary_message(self) -> str:
         """Build the bill summary TTS message using ledger data and message template."""

@@ -25,11 +25,20 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 # Database module (Prisma ORM with PostgreSQL)
 import db
+import re
+from account_context import (
+    PRIMARY_ACCOUNT,
+    current_account,
+    is_primary,
+    normalize_account_key,
+    set_account,
+    use_account,
+)
 
 app = FastAPI(title="Con Edison API")
 
 # Code version for deployment verification
-CODE_VERSION = "1.3.102"
+CODE_VERSION = "1.4.0"
 
 @app.on_event("startup")
 async def startup():
@@ -84,6 +93,39 @@ async def _with_db_retry(operation, label: str):
 async def get_version():
     """Simple endpoint to verify code deployment"""
     return {"version": CODE_VERSION, "database": "postgresql"}
+
+class AccountLabelModel(BaseModel):
+    label: str
+
+
+@app.get("/api/accounts")
+async def list_accounts():
+    """ConEd accounts on this login. Use a key as /api/a/<key>/... to read that account."""
+    accounts = await db.get_accounts()
+    return {
+        "accounts": [
+            {
+                "key": a["key"],
+                "label": a.get("label") or a["key"],
+                "number": a.get("number"),
+                "address": a.get("address"),
+                "status": a.get("status"),
+                "is_primary": a["key"] == PRIMARY_ACCOUNT,
+            }
+            for a in accounts
+        ],
+        "current": current_account(),
+    }
+
+
+@app.put("/api/accounts/{account_key}")
+async def rename_account(account_key: str, body: AccountLabelModel):
+    """Set the name shown for an account in the panel, alerts and HA sensors."""
+    updated = await db.update_account_label(normalize_account_key(account_key), body.label)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return {"key": updated["key"], "label": updated["label"]}
+
 
 @app.get("/api/db-status")
 async def get_db_status():
@@ -171,6 +213,52 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+_ACCOUNT_PATH_RE = re.compile(r"^/api/a/([^/]+)(/.*)?$")
+
+
+class AccountPathMiddleware:
+    """Pick the ConEd account for a request.
+
+    /api/a/<account>/ledger is served as /api/ledger for that account. This
+    keeps every endpoint unchanged and works for <img>/<iframe> URLs that
+    cannot send headers. An X-ConEd-Account header or ?account= also works.
+    Requests with no account use the primary account.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        account = None
+        path = scope.get("path") or ""
+        m = _ACCOUNT_PATH_RE.match(path)
+        if m:
+            account = m.group(1)
+            new_path = "/api" + (m.group(2) or "/")
+            scope = dict(scope)
+            scope["path"] = new_path
+            scope["raw_path"] = new_path.encode()
+        else:
+            for name, value in scope.get("headers") or []:
+                if name == b"x-coned-account":
+                    account = value.decode("latin-1")
+                    break
+            if account is None:
+                from urllib.parse import parse_qs
+                qs = parse_qs((scope.get("query_string") or b"").decode("latin-1"))
+                if qs.get("account"):
+                    account = qs["account"][0]
+        if account is None:
+            return await self.app(scope, receive, send)
+        with use_account(normalize_account_key(account)):
+            return await self.app(scope, receive, send)
+
+
+app.add_middleware(AccountPathMiddleware)
 
 # Configuration - use DATA_DIR env for addon (e.g. /config), else ./data
 from data_config import DATA_DIR
@@ -277,6 +365,143 @@ async def update_last_scrape_time():
     schedule["updated_at"] = utc_now_iso()
     await db.save_schedule_config_db(schedule)
 
+async def _post_scrape_alerts(scraped_data: dict):
+    """New payment / new bill TTS and notifications for the current account."""
+    # ==========================================
+    # TTS TRIGGERS AND NOTIFICATIONS
+    # ==========================================
+    
+    # Check for new payment TTS trigger
+    try:
+        tts_payment_trigger, tts_payment_data, tts_payment_reason = await should_trigger_payment_tts()
+        if tts_payment_trigger and tts_payment_data:
+            await db.add_log("info", f"Triggering payment TTS: {tts_payment_reason}")
+            from tts_scheduler import trigger_payment_received_tts
+            payment_amount = tts_payment_data.get("amount", "")
+            current_balance = scraped_data.get("account_balance", "")
+            payee_name = tts_payment_data.get("payee_name", "")
+            await trigger_payment_received_tts(payment_amount, current_balance, payee_name)
+            # Send push notification for payment
+            try:
+                from notifications import notify_payment_received
+                await notify_payment_received(
+                    amount=payment_amount,
+                    balance=current_balance,
+                    payee_name=payee_name
+                )
+            except Exception as notify_e:
+                await db.add_log("warning", f"Failed to send payment notification: {notify_e}")
+        else:
+            await db.add_log("debug", f"No payment TTS: {tts_payment_reason}")
+    except Exception as tts_e:
+        await db.add_log("warning", f"Failed to check/trigger payment TTS: {tts_e}")
+    
+    # Check for new bill TTS trigger
+    try:
+        tts_bill_trigger, tts_bill_data, tts_bill_reason = await should_trigger_new_bill_tts()
+        if tts_bill_trigger and tts_bill_data:
+            await db.add_log("info", f"Triggering new bill TTS: {tts_bill_reason}")
+            from tts_scheduler import trigger_new_bill_tts
+            await trigger_new_bill_tts(
+                bill_month_range=tts_bill_data.get("month_range", ""),
+                bill_total=tts_bill_data.get("bill_total", ""),
+                due_date=tts_bill_data.get("due_date", "")
+            )
+            # Send push notification for new bill
+            try:
+                from notifications import notify_new_bill
+                await notify_new_bill(
+                    amount=tts_bill_data.get("bill_total", "N/A"),
+                    due_date=tts_bill_data.get("due_date", "N/A"),
+                    month_range=tts_bill_data.get("month_range", "N/A")
+                )
+            except Exception as notify_e:
+                await db.add_log("warning", f"Failed to send new bill notification: {notify_e}")
+        else:
+            await db.add_log("debug", f"No bill TTS: {tts_bill_reason}")
+    except Exception as tts_e:
+        await db.add_log("warning", f"Failed to check/trigger bill TTS: {tts_e}")
+
+
+async def _post_scrape_payments():
+    """Auto-assign expired pending payments and send claim requests for the current account."""
+    # Auto-assign expired pending payments to default payee
+    try:
+        # Auto-assign expired pending payments
+        await db.auto_assign_expired_pending_payments()
+        result = {"message": "Auto-assigned expired pending payments"}
+        if result.get('assigned', 0) > 0:
+            await db.add_log("info", result.get('message', 'Auto-assigned expired pending payments'))
+    except Exception as auto_e:
+        await db.add_log("warning", f"Auto-assign expired payments failed: {auto_e}")
+    
+    # Send payment claim requests for new unverified payments (notification-based assignment)
+    try:
+        pv = await get_payment_verification_settings()
+        if pv.get("notification_claims_enabled", True) and pv.get("auto_send_claims_after_scrape", True):
+            from notifications import send_payment_claim_request
+            payments_to_claim = await db.get_unverified_payments_with_no_claim_responses()
+            payments_to_claim = await _claimable_since_account_added(payments_to_claim)
+            payees = await db.get_payees_with_notifications()
+            if payments_to_claim and payees:
+                for payment in payments_to_claim:
+                    sent = await send_payment_claim_request(payment, payees)
+                    if sent > 0:
+                        await db.add_log("info", f"Sent payment claim request to {sent} payee(s) for payment ${payment.get('amount_numeric', 0):.2f}")
+    except Exception as claim_e:
+        await db.add_log("warning", f"Payment claim notifications failed: {claim_e}")
+
+
+async def _claimable_since_account_added(payments: list) -> list:
+    """For an added account, only ask payees about payments seen after it was added.
+
+    Its first scrape brings in its whole payment history; asking about every
+    old payment would flood each payee with notifications. Primary keeps the
+    original behavior.
+    """
+    if is_primary():
+        return payments
+    baseline = await db.get_app_setting("claims_baseline")
+    if not baseline:
+        await db.set_app_setting("claims_baseline", utc_now_iso())
+        if payments:
+            await db.add_log("info", f"Added account: {len(payments)} earlier payment(s) left for manual assignment")
+        return []
+    cutoff = datetime.fromisoformat(baseline)
+    newer = []
+    for p in payments:
+        seen = p.get("first_scraped_at")
+        if seen is not None and seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        if seen is not None and seen > cutoff:
+            newer.append(p)
+    return newer
+
+
+def _scraped_accounts(result: dict) -> dict:
+    """{account_key: scraped_data} from perform_login. Older single-account results map to primary."""
+    accounts = result.get("accounts")
+    if isinstance(accounts, dict) and accounts:
+        return accounts
+    data = result.get("data") or {}
+    return {PRIMARY_ACCOUNT: data} if data else {}
+
+
+async def _run_post_scrape(result: dict, include_payments: bool) -> None:
+    """Run alerts (and payment follow-ups) once per scraped account."""
+    if not result.get("success"):
+        return
+    for account_key, scraped_data in _scraped_accounts(result).items():
+        with use_account(account_key):
+            try:
+                if scraped_data:
+                    await _post_scrape_alerts(scraped_data)
+                if include_payments:
+                    await _post_scrape_payments()
+            except Exception as e:
+                await db.add_log("warning", f"Post-scrape steps failed for account {account_key}: {e}")
+
+
 async def run_scheduled_scrape():
     """Run a scheduled scrape"""
     global _scrape_running
@@ -301,91 +526,7 @@ async def run_scheduled_scrape():
         await db.add_log("info", "Starting scheduled scrape...")
         result = await perform_login(username, password, totp_code)
         success = result.get('success', False)
-        scraped_data = result.get('data', {})
-        
-        if success and scraped_data:
-            # ==========================================
-            # TTS TRIGGERS AND NOTIFICATIONS
-            # ==========================================
-            
-            # Check for new payment TTS trigger
-            try:
-                tts_payment_trigger, tts_payment_data, tts_payment_reason = await should_trigger_payment_tts()
-                if tts_payment_trigger and tts_payment_data:
-                    await db.add_log("info", f"Triggering payment TTS: {tts_payment_reason}")
-                    from tts_scheduler import trigger_payment_received_tts
-                    payment_amount = tts_payment_data.get("amount", "")
-                    current_balance = scraped_data.get("account_balance", "")
-                    payee_name = tts_payment_data.get("payee_name", "")
-                    await trigger_payment_received_tts(payment_amount, current_balance, payee_name)
-                    # Send push notification for payment
-                    try:
-                        from notifications import notify_payment_received
-                        await notify_payment_received(
-                            amount=payment_amount,
-                            balance=current_balance,
-                            payee_name=payee_name
-                        )
-                    except Exception as notify_e:
-                        await db.add_log("warning", f"Failed to send payment notification: {notify_e}")
-                else:
-                    await db.add_log("debug", f"No payment TTS: {tts_payment_reason}")
-            except Exception as tts_e:
-                await db.add_log("warning", f"Failed to check/trigger payment TTS: {tts_e}")
-            
-            # Check for new bill TTS trigger
-            try:
-                tts_bill_trigger, tts_bill_data, tts_bill_reason = await should_trigger_new_bill_tts()
-                if tts_bill_trigger and tts_bill_data:
-                    await db.add_log("info", f"Triggering new bill TTS: {tts_bill_reason}")
-                    from tts_scheduler import trigger_new_bill_tts
-                    await trigger_new_bill_tts(
-                        bill_month_range=tts_bill_data.get("month_range", ""),
-                        bill_total=tts_bill_data.get("bill_total", ""),
-                        due_date=tts_bill_data.get("due_date", "")
-                    )
-                    # Send push notification for new bill
-                    try:
-                        from notifications import notify_new_bill
-                        await notify_new_bill(
-                            amount=tts_bill_data.get("bill_total", "N/A"),
-                            due_date=tts_bill_data.get("due_date", "N/A"),
-                            month_range=tts_bill_data.get("month_range", "N/A")
-                        )
-                    except Exception as notify_e:
-                        await db.add_log("warning", f"Failed to send new bill notification: {notify_e}")
-                else:
-                    await db.add_log("debug", f"No bill TTS: {tts_bill_reason}")
-            except Exception as tts_e:
-                await db.add_log("warning", f"Failed to check/trigger bill TTS: {tts_e}")
-            
-        # Due date reminders now run at configured time via due_reminder_scheduler_loop
-        
-        if success:
-            # Auto-assign expired pending payments to default payee
-            try:
-                # Auto-assign expired pending payments
-                await db.auto_assign_expired_pending_payments()
-                result = {"message": "Auto-assigned expired pending payments"}
-                if result.get('assigned', 0) > 0:
-                    await db.add_log("info", result.get('message', 'Auto-assigned expired pending payments'))
-            except Exception as auto_e:
-                await db.add_log("warning", f"Auto-assign expired payments failed: {auto_e}")
-            
-            # Send payment claim requests for new unverified payments (notification-based assignment)
-            try:
-                pv = await get_payment_verification_settings()
-                if pv.get("notification_claims_enabled", True) and pv.get("auto_send_claims_after_scrape", True):
-                    from notifications import send_payment_claim_request
-                    payments_to_claim = await db.get_unverified_payments_with_no_claim_responses()
-                    payees = await db.get_payees_with_notifications()
-                    if payments_to_claim and payees:
-                        for payment in payments_to_claim:
-                            sent = await send_payment_claim_request(payment, payees)
-                            if sent > 0:
-                                await db.add_log("info", f"Sent payment claim request to {sent} payee(s) for payment ${payment.get('amount_numeric', 0):.2f}")
-            except Exception as claim_e:
-                await db.add_log("warning", f"Payment claim notifications failed: {claim_e}")
+        await _run_post_scrape(result, include_payments=True)
         
         duration = time_module.time() - start_time
         await db.add_scrape_history(success, None if success else "Scrape failed", None, duration)
@@ -398,6 +539,18 @@ async def run_scheduled_scrape():
         logging.error(error_msg)
     finally:
         _scrape_running = False
+
+async def _for_each_account(job) -> int:
+    """Run a daily job once per ConEd account and add up what it returns."""
+    total = 0
+    for account_key in await db.get_account_keys():
+        with use_account(account_key):
+            try:
+                total += await job() or 0
+            except Exception as e:
+                await db.add_log("warning", f"{getattr(job, '__name__', 'job')} failed for account {account_key}: {e}")
+    return total
+
 
 async def scheduler_loop():
     """Background scheduler loop - runs scrapes based on last_scrape_end + frequency"""
@@ -465,7 +618,7 @@ async def payee_balance_reminder_scheduler_loop():
             try:
                 from notifications import check_and_send_payee_balance_reminders
 
-                sent = await check_and_send_payee_balance_reminders()
+                sent = await _for_each_account(check_and_send_payee_balance_reminders)
                 if sent > 0:
                     await db.add_log("info", f"Payee balance reminder sent to {sent} device(s)")
             except Exception as e:
@@ -501,7 +654,7 @@ async def underpayment_streak_tts_scheduler_loop():
             try:
                 from tts_scheduler import check_and_trigger_underpayment_streak_tts
 
-                n = await check_and_trigger_underpayment_streak_tts()
+                n = await _for_each_account(check_and_trigger_underpayment_streak_tts)
                 if n and n > 0:
                     await db.add_log("info", f"Underpayment streak TTS sent ({n} announcement(s))")
             except Exception as e:
@@ -536,7 +689,7 @@ async def due_reminder_scheduler_loop():
             _last_due_reminder_run_date = today
             try:
                 from notifications import check_and_send_due_reminders
-                sent = await check_and_send_due_reminders()
+                sent = await _for_each_account(check_and_send_due_reminders)
                 if sent > 0:
                     await db.add_log("info", f"Due reminder sent to {sent} device(s)")
             except Exception as e:
@@ -557,21 +710,21 @@ async def claim_resend_scheduler_loop():
             if not pv.get("notification_claims_enabled", True):
                 continue
             delay_hours = int(pv.get("claim_resend_delay_hours", 24))
-            candidates = await db.get_payments_for_claim_resend(claim_resend_delay_hours=delay_hours)
-            if not candidates:
-                continue
             from notifications import send_payment_claim_request
             payees = await db.get_payees_with_notifications()
             if not payees:
                 continue
-            for payment in candidates:
-                try:
-                    await db.reset_claim_responses_for_resend(payment["id"])
-                    sent = await send_payment_claim_request(payment, payees)
-                    if sent > 0:
-                        await db.add_log("info", f"Resent payment claim request for payment ${payment.get('amount_numeric', 0):.2f} (all had said No)")
-                except Exception as e:
-                    await db.add_log("warning", f"Claim resend failed for payment {payment.get('id')}: {e}")
+            for account_key in await db.get_account_keys():
+                with use_account(account_key):
+                    candidates = await db.get_payments_for_claim_resend(claim_resend_delay_hours=delay_hours)
+                    for payment in candidates:
+                        try:
+                            await db.reset_claim_responses_for_resend(payment["id"])
+                            sent = await send_payment_claim_request(payment, payees)
+                            if sent > 0:
+                                await db.add_log("info", f"Resent payment claim request for payment ${payment.get('amount_numeric', 0):.2f} (all had said No)")
+                        except Exception as e:
+                            await db.add_log("warning", f"Claim resend failed for payment {payment.get('id')}: {e}")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -615,6 +768,10 @@ async def startup_event():
 async def _start_background_services():
     global _scheduler_task, _due_reminder_task, _claim_resend_task
     global _payee_balance_reminder_task, _underpayment_streak_tts_task
+
+    accounts = await db.get_accounts()  # also caches account labels for alerts
+    if len(accounts) > 1:
+        await db.add_log("info", f"Tracking {len(accounts)} ConEd accounts")
 
     schedule = await load_schedule()
     if schedule["enabled"]:
@@ -834,6 +991,21 @@ async def should_trigger_payment_tts() -> tuple:
         return False, None, "No payments found"
     
     current_last_id = latest_payment.get("id")
+
+    if (
+        not is_primary()
+        and previous_bill_id is None
+        and previous_last_payment_id is None
+        and not previous_count
+    ):
+        # First scrape of an added account: record a baseline instead of
+        # announcing its existing payments as new
+        await save_tts_payment_state({
+            "bill_id": current_bill_id,
+            "payment_count": current_count,
+            "last_payment_id": current_last_id,
+        })
+        return False, None, "First check for this account; baseline saved"
     
     # Case 1: Same bill, payment count increased = new payment added
     if current_bill_id == previous_bill_id and current_count > previous_count:
@@ -1186,64 +1358,8 @@ async def start_scraper():
     try:
         result = await perform_login(username, password, totp_code)
         success = result.get('success', False)
-        scraped_data = result.get('data', {})
+        await _run_post_scrape(result, include_payments=False)
         
-        if success and scraped_data:
-            # ==========================================
-            # TTS TRIGGERS AND NOTIFICATIONS
-            # ==========================================
-            
-            # Check for new payment TTS trigger
-            try:
-                tts_payment_trigger, tts_payment_data, tts_payment_reason = await should_trigger_payment_tts()
-                if tts_payment_trigger and tts_payment_data:
-                    await db.add_log("info", f"Triggering payment TTS: {tts_payment_reason}")
-                    from tts_scheduler import trigger_payment_received_tts
-                    payment_amount = tts_payment_data.get("amount", "")
-                    current_balance = scraped_data.get("account_balance", "")
-                    payee_name = tts_payment_data.get("payee_name", "")
-                    await trigger_payment_received_tts(payment_amount, current_balance, payee_name)
-                    # Send push notification for payment
-                    try:
-                        from notifications import notify_payment_received
-                        await notify_payment_received(
-                            amount=payment_amount,
-                            balance=current_balance,
-                            payee_name=payee_name
-                        )
-                    except Exception as notify_e:
-                        await db.add_log("warning", f"Failed to send payment notification: {notify_e}")
-                else:
-                    await db.add_log("debug", f"No payment TTS: {tts_payment_reason}")
-            except Exception as tts_e:
-                await db.add_log("warning", f"Failed to check/trigger payment TTS: {tts_e}")
-            
-            # Check for new bill TTS trigger
-            try:
-                tts_bill_trigger, tts_bill_data, tts_bill_reason = await should_trigger_new_bill_tts()
-                if tts_bill_trigger and tts_bill_data:
-                    await db.add_log("info", f"Triggering new bill TTS: {tts_bill_reason}")
-                    from tts_scheduler import trigger_new_bill_tts
-                    await trigger_new_bill_tts(
-                        bill_month_range=tts_bill_data.get("month_range", ""),
-                        bill_total=tts_bill_data.get("bill_total", ""),
-                        due_date=tts_bill_data.get("due_date", "")
-                    )
-                    # Send push notification for new bill
-                    try:
-                        from notifications import notify_new_bill
-                        await notify_new_bill(
-                            amount=tts_bill_data.get("bill_total", "N/A"),
-                            due_date=tts_bill_data.get("due_date", "N/A"),
-                            month_range=tts_bill_data.get("month_range", "N/A")
-                        )
-                    except Exception as notify_e:
-                        await db.add_log("warning", f"Failed to send new bill notification: {notify_e}")
-                else:
-                    await db.add_log("debug", f"No bill TTS: {tts_bill_reason}")
-            except Exception as tts_e:
-                await db.add_log("warning", f"Failed to check/trigger bill TTS: {tts_e}")
-            
         # Due date reminders run at configured time via due_reminder_scheduler_loop
         
         duration = time_module.time() - start_time
@@ -1529,6 +1645,8 @@ async def get_screenshot(filename: str):
     
     # Allowed screenshot filenames
     allowed_files = ["account_balance.png", "live_preview.png"]
+    if re.fullmatch(r"account_balance@\d+\.png", filename or ""):
+        allowed_files.append(filename)
     if filename not in allowed_files:
         return JSONResponse({"error": "Screenshot not found"}, status_code=404)
     
@@ -2158,6 +2276,13 @@ class ClaimActionModel(BaseModel):
     action: str
 
 
+async def _use_payment_account(payment_id: int) -> None:
+    """Notification actions come from HA without an account. Follow the payment's account."""
+    account_key = await db.account_of_payment(payment_id)
+    if account_key:
+        set_account(account_key)
+
+
 async def handle_petition_notification_action(action: str) -> Dict[str, Any]:
     """
     Handle CONED_PETITION_YES_<payment_id>_<assignee_payee_id>_<petitioner_payee_id>
@@ -2175,6 +2300,7 @@ async def handle_petition_notification_action(action: str) -> Dict[str, Any]:
         petitioner_id = int(parts[5])
     except (ValueError, IndexError):
         raise HTTPException(status_code=400, detail="Invalid petition action")
+    await _use_payment_account(payment_id)
 
     payment = await db.get_payment_by_id(payment_id)
     if not payment:
@@ -2261,6 +2387,7 @@ async def record_payee_claim_by_action(body: ClaimActionModel):
         claimed = parts[2].upper() == "YES"
     except (ValueError, IndexError):
         raise HTTPException(status_code=400, detail="Invalid action format")
+    await _use_payment_account(payment_id)
     return await record_payee_claim(payment_id, PayeeClaimModel(payee_id=payee_id, claimed=claimed))
 
 

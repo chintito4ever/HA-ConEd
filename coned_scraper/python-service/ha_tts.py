@@ -187,6 +187,12 @@ async def send_tts(
 
 async def speak_from_config(message: str, tts_config: dict) -> tuple[bool, str]:
     """Speak using the saved addon TTS config (Home-Delivery tts.speak path)."""
+    from account_context import current_account_label
+
+    label = current_account_label()
+    if label and label not in message:
+        # Several ConEd accounts: say which one this is about
+        message = f"{label}. {message}"
     return await send_tts(
         message=message,
         media_player=(tts_config.get("media_player") or "").strip(),

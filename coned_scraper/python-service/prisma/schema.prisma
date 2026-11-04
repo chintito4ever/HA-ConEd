@@ -12,6 +12,7 @@ generator client {
 
 model Bill {
   id             Int       @id @default(autoincrement())
+  accountId      String    @default("primary") @map("account_id")
   billCycleDate  DateTime  @map("bill_cycle_date")
   billDate       DateTime? @map("bill_date")
   monthRange     String?   @map("month_range")
@@ -24,13 +25,15 @@ model Bill {
   document BillDocument?
   details  BillDetails?
 
-  @@unique([billCycleDate, monthRange])
+  @@unique([accountId, billCycleDate, monthRange])
   @@index([billCycleDate])
+  @@index([accountId])
   @@map("bills")
 }
 
 model Payment {
   id                 Int       @id @default(autoincrement())
+  accountId          String    @default("primary") @map("account_id")
   paymentDate        DateTime  @map("payment_date")
   description        String?
   amount             Decimal   @db.Decimal(10, 2)
@@ -55,6 +58,7 @@ model Payment {
   @@index([paymentDate])
   @@index([billId])
   @@index([firstScrapedAt])
+  @@index([accountId])
   @@map("payments")
 }
 
@@ -143,21 +147,25 @@ model PayeeUser {
 
 model AccountBalanceHistory {
   id                  Int      @id @default(autoincrement())
+  accountId           String   @default("primary") @map("account_id")
   balance             Decimal  @db.Decimal(10, 2)
   scrapedAt           DateTime @default(now()) @map("scraped_at")
   changedFromPrevious Boolean  @default(false) @map("changed_from_previous")
 
+  @@index([accountId])
   @@map("account_balance_history")
 }
 
 model ScrapedData {
   id             Int      @id @default(autoincrement())
+  accountId      String   @default("primary") @map("account_id")
   timestamp      DateTime @default(now())
   data           Json
   status         String
   errorMessage   String?  @map("error_message")
   screenshotPath String?  @map("screenshot_path")
 
+  @@index([accountId])
   @@map("scraped_data")
 }
 
@@ -191,12 +199,13 @@ model AppSetting {
 
 model RealtimeReading {
   id           Int      @id @default(autoincrement())
+  accountId    String   @default("primary") @map("account_id")
   startTime    DateTime @map("start_time")
   endTime      DateTime @map("end_time")
   consumption  Float    @db.Real
   fetchedAt    DateTime @default(now()) @map("fetched_at")
 
-  @@unique([startTime, endTime])
+  @@unique([accountId, startTime, endTime])
   @@index([endTime])
   @@map("realtime_readings")
 }
