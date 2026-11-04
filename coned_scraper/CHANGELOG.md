@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.2
+
+### Fixed
+- Prisma Studio starts with Prisma 6 (it has no `--url` option). If Studio ever fails, the log says so once instead of restarting it every few seconds
+
 ## 1.4.1
 
 ### Fixed

@@ -20,5 +20,12 @@ done
 sleep 2
 bashio::log.info "PostgreSQL is ready, starting Prisma Studio on port ${PRISMA_STUDIO_PORT}..."
 
-# Pass DATABASE_URL directly via --url argument (more reliable than export)
-exec prisma studio --port "${PRISMA_STUDIO_PORT}" --browser none --url "postgresql://coned:coned@localhost:${POSTGRES_PORT}/coned"
+# Prisma 6 reads the database from the schema's DATABASE_URL (it has no --url option)
+export DATABASE_URL="postgresql://coned:coned@localhost:${POSTGRES_PORT}/coned"
+prisma studio --schema prisma/schema.prisma --port "${PRISMA_STUDIO_PORT}" --hostname 0.0.0.0 --browser none
+status=$?
+
+# Studio is optional. If it can't run, say so once and stay idle instead of
+# letting s6 restart it every few seconds.
+bashio::log.warning "Prisma Studio exited (code ${status}); not restarting. The addon works without it."
+exec sleep infinity
