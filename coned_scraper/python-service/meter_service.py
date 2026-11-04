@@ -106,6 +106,7 @@ class MeterService:
         self._opower = None
         self._session = None
         self._accounts: List[Any] = []
+        self._logged_pairs: set = set()
         self._fetch_lock = asyncio.Lock()
 
     async def _close_session(self) -> None:
@@ -233,6 +234,17 @@ class MeterService:
         chosen = match_opower_accounts(accounts, registry).get(current_account())
         if chosen is None:
             logger.warning("No opower meter matched ConEd account %s", current_account())
+            return None
+        pair = (current_account(), chosen.uuid)
+        if pair not in self._logged_pairs:
+            # Say once which meter each account uses, so a wrong pairing is visible in the log
+            self._logged_pairs.add(pair)
+            label = next((a.get("label") for a in registry if a["key"] == current_account()), current_account())
+            await db.add_log(
+                "info",
+                f"Usage for {label}: Opower meter {chosen.utility_account_id} "
+                f"({chosen.meter_type}, {chosen.read_resolution})",
+            )
         return chosen
 
     async def _get_accounts(self) -> List[Any]:

@@ -230,16 +230,9 @@ async def run_migrations():
             """)
             
             # Migration: readings are unique per account (multi-account). The old
-            # (start_time, end_time) index would block a second account's readings.
+            # (start_time, end_time) index would block a second account's readings;
+            # the Prisma schema owns the per-account unique key.
             await conn.execute("DROP INDEX IF EXISTS realtime_readings_start_end_key")
-            await conn.execute("""
-                ALTER TABLE realtime_readings
-                ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'primary'
-            """)
-            await conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS realtime_readings_account_start_end_key
-                ON realtime_readings(account_id, start_time, end_time)
-            """)
             
             logger.info("Database migrations completed successfully")
         finally:

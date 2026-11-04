@@ -43,9 +43,10 @@ If your coned.com login has several service accounts (for example two gas accoun
 - **Discovery:** each scrape reads the "My Service Accounts" list on coned.com and scrapes every account in it.
 - **Your existing data:** the first time several accounts show up, the addon compares your stored bills with each account's bill history and keeps them with the account they match.
 - **Panel:** pick an account from the **Account** menu in the header. ✏️ renames it. Names default to the service address.
-- **Home Assistant:** the ConEd Connect integration creates one device per account. The original account keeps its `sensor.coned_connect_*` entities. Other accounts get entities named after the account, for example `sensor.coned_connect_unit_2_account_balance`. Reload the integration after a new account first appears.
+- **Home Assistant:** the ConEd Connect integration creates one device per account. The original account keeps its `sensor.coned_connect_*` entities. Other accounts get entities named after the account, for example `sensor.coned_connect_unit_2_account_balance`. Reload the integration after a new account first appears (it is listed after the first scrape that finds it).
 - **Shared settings:** credentials, payees, notification and TTS settings apply to every account. Notifications and TTS name the account they are about.
 - **Usage (Opower):** each account uses its own meter. Gas meters usually report daily, in therms or CCF. Some panel charts still say kWh.
+- **Wipe data:** wiping bills and payments in Settings only clears the account selected in the header.
 - **API:** `GET /api/accounts` lists the account keys. Prefix any endpoint with `/api/a/<key>/` to read that account, for example `/api/a/<key>/ledger`. Requests without a key use the primary account.
 
 ### Moving from the original addon
@@ -54,8 +55,10 @@ This addon has a different slug from the original, so it has its own data folder
 
 1. Make a Home Assistant backup.
 2. Stop the original **Con Edison** addon. Don't start both at once: they would both scrape and send duplicate notifications.
-3. Start this addon. On first start it copies the original's database, credentials and settings, and the ConEd Connect integration switches to this addon automatically.
-4. Once everything looks right, uninstall the original addon.
+3. Start this addon. On first start it copies the original's database, credentials and settings, and installs its own copy of the ConEd Connect integration.
+4. Restart Home Assistant. The integration then switches to this addon by itself and keeps your existing sensors. A reload of the integration alone is not enough.
+5. Run a scrape. The log lists the accounts it found, which one your existing data was matched to, and which Opower meter each account uses.
+6. Once everything looks right, uninstall the original addon.
 
 If the original was still running at first start, the log says the import was skipped. Stop both addons, delete `postgres` in this addon's config folder (`/addon_configs/<slug>/`), then start this addon again.
 
