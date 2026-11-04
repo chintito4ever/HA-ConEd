@@ -44,7 +44,7 @@ COPY python-service/prisma /app/python-service/prisma/
 RUN cd /app/python-service && python3 -m prisma generate
 
 # Install Prisma CLI globally for Prisma Studio (force to overwrite any existing)
-RUN npm install -g prisma --force
+RUN npm install -g prisma@6 --force
 
 # Copy full Python service
 COPY python-service/ /app/python-service/

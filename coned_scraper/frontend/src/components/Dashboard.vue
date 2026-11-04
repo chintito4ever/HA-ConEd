@@ -166,13 +166,21 @@ async function handleStartScraper() {
   try {
     await fetch(`${getApiBase()}/logs`, { method: 'DELETE' }).catch(() => {})
     const controller = new AbortController()
-    const timeoutId = setTimeout(() => controller.abort(), 30000)
+    // A scrape logs in and visits every ConEd account; with several accounts it
+    // takes minutes. Wait long enough, and keep polling logs meanwhile.
+    const timeoutId = setTimeout(() => controller.abort(), 15 * 60 * 1000)
+    const logPoll = setInterval(loadLogs, 3000)
+    let timedOut = false
     const response = await fetch(`${getApiBase()}/scrape`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       signal: controller.signal,
-    }).catch(() => null)
+    }).catch((err) => {
+      timedOut = err?.name === 'AbortError'
+      return null
+    })
     clearTimeout(timeoutId)
+    clearInterval(logPoll)
 
     if (response?.ok) {
       const result = await response.json()
@@ -192,9 +200,12 @@ async function handleStartScraper() {
       }
       status.value = 'error'
       apiError.value = `Scraper error: ${errorMessage}`
+    } else if (timedOut) {
+      status.value = 'stopped'
+      setTimeout(loadLogs, 1000)
     } else {
       status.value = 'error'
-      apiError.value = "Cannot connect to Python service. Make sure it's running on port 8000."
+      apiError.value = "Lost connection to the add-on while scraping. The scrape may still be running; check the logs below."
     }
   } catch {
     status.value = 'error'

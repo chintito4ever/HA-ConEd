@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.1
+
+### Fixed
+- Start Scraper no longer shows "Cannot connect to Python service" while a long scrape is still running. The panel waits for it and shows the logs as it goes
+- Prisma Studio starts again instead of failing every few seconds in the log
+
 ## 1.4.0
 
 ### Added
